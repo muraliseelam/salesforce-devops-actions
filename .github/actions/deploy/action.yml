@@ -213,11 +213,14 @@ runs:
             args+=(--coverage-formatters json-summary --results-dir "$WORK/results")
           fi
           if [ "$IGNORE_WARNINGS" = true ]; then args+=(--ignore-warnings); fi
+          # --ignore-conflicts: a fresh runner has no source-tracking state, so orgs with
+          # tracking (scratch orgs, tracked sandboxes) would otherwise fail every
+          # `deploy start` with SourceConflictError. `deploy validate` doesn't track.
           if [ "$MODE" = deploy ]; then
-            cmd=(sf project deploy start)
+            cmd=(sf project deploy start --ignore-conflicts)
           elif [ "$TEST_LEVEL" = NoTestRun ]; then
             # `deploy validate` rejects NoTestRun; a dry-run start is the check-only equivalent.
-            cmd=(sf project deploy start --dry-run)
+            cmd=(sf project deploy start --dry-run --ignore-conflicts)
           else
             cmd=(sf project deploy validate)
           fi
