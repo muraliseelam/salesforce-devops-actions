@@ -30,6 +30,18 @@ Legend: `[x]` done and verified · `[~]` in progress · `[ ]` to do · `[!]` blo
 - [x] B3 Real `sf` JSON captured from scratch orgs (success, test failure, coverage, compile error) and used as report fixtures — 5 fixtures from real sf 2.153 output; found that failed `deploy validate` returns only data.deployId → action now fetches `deploy report`
 - [x] B4 Local auth-URL login round trip works through the same commands sf-setup runs — stdin login round trip OK; found `--sfdx-url-stdin` needs `-`
 
+## R. Independent runtime reviews (fixed + re-tested)
+- [x] R1 Release PR mergeable while awaiting approval → deploy-prod stays pending until production has the release
+- [x] R2 Double prod deploy on re-run after a failed merge → `deployed=<sha>` marker; resolve picks deploy/finalize/finish/done
+- [x] R3 Forgeable PR-body marker → deploy trusts only the `sf-release-validation` status posted by github-actions
+- [x] R4 sf-approval leaking between promotion PRs sharing a head SHA → unique promotion commit per PR + open-PR-only approvals
+- [x] R5 Prepare/deploy overlap and stale validation → one concurrency group; prepare resets marker; missing status = failed
+- [x] R6 Quick-deploy fallback on timeout could double deploy → fall back only on CannotQuickDeployError
+- [x] R7 Admin PAT readable from any branch → optional `admin_pat_secret`, sync runs in the protected validation environment
+- [x] R8 Auto-created unprotected environments never repaired → bootstrap repairs policy/reviewers; doctor checks them
+- [x] R9 Post-merge race in commit→PR lookup → retry + `(#N)` subject fallback
+- [x] R10 Smaller: dispatch on baseline ref, CRLF-safe secret piping, case-insensitive labels, annotation escaping, non-string env keys, compare-API failure message, PR validation uses default-branch pipeline files
+
 ## C. GitHub bootstrap
 - [x] C1 Pipeline committed and pushed to `main` — 3cec2ea + follow-ups
 - [x] C2 `bootstrap.py github` applied to the live repo — branches, labels, environments, protection live

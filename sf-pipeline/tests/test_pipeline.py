@@ -24,6 +24,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import bootstrap  # noqa: E402
 import branch_protection  # noqa: E402
+import code_analysis  # noqa: E402
 import deploy_report  # noqa: E402
 import gh_helpers  # noqa: E402
 import pipeline_config  # noqa: E402
@@ -625,6 +626,37 @@ class GhHelpersTests(unittest.TestCase):
         self.assertEqual(gh_helpers.read_marker(twice, "sf-release"), {"sha": "def"})
         self.assertTrue(twice.startswith("Release notes"))
         self.assertEqual(gh_helpers.read_marker("no marker", "sf-release"), {})
+
+
+class CodeAnalysisTests(unittest.TestCase):
+    DATA = json.loads((FIXTURES / "code-analyzer.json").read_text(encoding="utf-8"))
+
+    def test_real_output_engine_errors_dont_block(self):
+        result = code_analysis.analyze(self.DATA, threshold=2)
+        self.assertEqual(len(result["violations"]), 6)          # ApexDoc (Low)
+        self.assertEqual(len(result["engine_errors"]), 1)       # flow engine without Python
+        self.assertEqual(result["blocking"], [])
+        text = code_analysis.render(result, "dev", 2, "")
+        self.assertIn("<!-- sf-pipeline-analysis:dev -->", text)
+        self.assertIn("No violations at High or worse", text)
+        self.assertIn("Engine `flow` didn't run", text)
+        self.assertEqual(code_analysis.annotations(result, 2), [])  # Low findings aren't annotated
+
+    def test_threshold_blocks_and_annotates(self):
+        data = {"violations": [
+            {"rule": "ApexCRUDViolation", "engine": "pmd", "severity": 2, "primaryLocationIndex": 0,
+             "locations": [{"file": "force-app/main/default/classes/A.cls", "startLine": 7, "startColumn": 3}],
+             "message": "Validate CRUD permission before SOQL/DML operation"},
+            {"rule": "AvoidDebugStatements", "engine": "pmd", "severity": 3, "primaryLocationIndex": 0,
+             "locations": [{"file": "force-app/main/default/classes/A.cls", "startLine": 9}], "message": "Avoid debug"},
+        ]}
+        result = code_analysis.analyze(data, threshold=2)
+        self.assertEqual(len(result["blocking"]), 1)
+        notes = code_analysis.annotations(result, 2)
+        self.assertTrue(notes[0].startswith("::error file=force-app/main/default/classes/A.cls,line=7,col=3,title=High ApexCRUDViolation::"))
+        self.assertTrue(notes[1].startswith("::warning "))
+        self.assertIn("1 blocking violation", code_analysis.render(result, "dev", 2, ""))
+        self.assertEqual(code_analysis.analyze(data, threshold=1)["blocking"], [])
 
 
 class BootstrapTests(unittest.TestCase):

@@ -201,9 +201,80 @@ jobs:
           } > "$RUNNER_TEMP/login.md"
           python3 sf-pipeline/scripts/gh_helpers.py upsert-comment --pr "$PR_NUMBER" --marker "$marker" --body-file "$RUNNER_TEMP/login.md"
 
+  analyze:
+    name: Code analysis
+    needs: [plan, preflight]
+    if: >-
+      needs.plan.outputs.run == 'true' && needs.preflight.outputs.has_sf_changes == 'true' &&
+      fromJSON(needs.plan.outputs.cfg).code_analyzer_enabled == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Use pipeline files from the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: git checkout "origin/${DEFAULT_BRANCH}" -- .github/actions sf-pipeline
+
+      - name: sf CLI + Code Analyzer (no org login)
+        uses: ./.github/actions/sf-setup
+        with:
+          environment: ${{ needs.plan.outputs.env }}
+          login: "false"
+          code-analyzer: "true"
+
+      - name: Analyze changed files
+        id: run
+        env:
+          BASELINE: ${{ fromJSON(needs.plan.outputs.cfg).baseline_branch }}
+          SOURCE_PATH: ${{ fromJSON(needs.plan.outputs.cfg).source_path }}
+          RULES: ${{ fromJSON(needs.plan.outputs.cfg).code_analyzer_rules }}
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/${BASELINE}" HEAD)"
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$base" HEAD -- "$SOURCE_PATH")
+          echo "count=${#files[@]}" >> "$GITHUB_OUTPUT"
+          if [ "${#files[@]}" -eq 0 ]; then echo "No changed files to analyze"; exit 0; fi
+          args=()
+          for f in "${files[@]}"; do args+=(--target "$f"); done
+          printf 'Analyzing %s file(s)\n' "${#files[@]}"
+          # Without --severity-threshold the command only fails on real errors; the gate is applied below.
+          sf code-analyzer run --workspace "$SOURCE_PATH" "${args[@]}" --rule-selector "$RULES" \
+            --output-file "$RUNNER_TEMP/code-analyzer.json" --view table
+
+      - name: Report
+        id: report
+        if: always() && steps.run.outputs.count != '0' && steps.run.outcome != 'skipped'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ENV_NAME: ${{ needs.plan.outputs.env }}
+          THRESHOLD: ${{ fromJSON(needs.plan.outputs.cfg).code_analyzer_threshold }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python sf-pipeline/scripts/code_analysis.py --results "$RUNNER_TEMP/code-analyzer.json" --env "$ENV_NAME" \
+            --threshold "$THRESHOLD" --output "$RUNNER_TEMP/analysis.md" --run-url "$RUN_URL" --annotate --github-output
+          cat "$RUNNER_TEMP/analysis.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 sf-pipeline/scripts/gh_helpers.py upsert-comment --pr "$PR_NUMBER" \
+            --marker "<!-- sf-pipeline-analysis:${ENV_NAME} -->" --body-file "$RUNNER_TEMP/analysis.md"
+
+      - name: Fail on blocking violations
+        if: steps.report.outputs.passed == 'false'
+        env:
+          BLOCKING: ${{ steps.report.outputs.blocking }}
+        run: |
+          echo "::error title=Code analysis::${BLOCKING} blocking violation(s); see the Code Analysis comment."
+          exit 1
+
   gate:
     name: Gate
-    needs: [plan, preflight, validate]
+    needs: [plan, preflight, validate, analyze]
     if: ${{ !cancelled() && needs.plan.outputs.run == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -220,6 +291,7 @@ jobs:
         env:
           PREFLIGHT: ${{ needs.preflight.result }}
           VALIDATE: ${{ needs.validate.result }}
+          ANALYZE: ${{ needs.analyze.result }}
           HAS_CHANGES: ${{ needs.preflight.outputs.has_sf_changes }}
           ORG_ALIAS: ${{ fromJSON(needs.plan.outputs.cfg).org_alias }}
         run: |
@@ -228,10 +300,13 @@ jobs:
             state=failure; desc="Preflight failed (routing, meta pairs or branch origin)"; comment=create
           elif [ "$HAS_CHANGES" != "true" ]; then
             state=success; desc="No Salesforce metadata changes"; comment=update
-          elif [ "$VALIDATE" = "success" ]; then
-            state=success; desc="Check-only validation passed on ${ORG_ALIAS}"
-          else
+          elif [ "$VALIDATE" != "success" ]; then
             state=failure; desc="Check-only validation against ${ORG_ALIAS} did not pass (${VALIDATE})"
+          elif [ "$ANALYZE" = "failure" ] || [ "$ANALYZE" = "cancelled" ]; then
+            state=failure; desc="Validation passed on ${ORG_ALIAS}, but code analysis found blocking violations"
+          else
+            state=success; desc="Check-only validation passed on ${ORG_ALIAS}"
+            [ "$ANALYZE" = "success" ] && desc="${desc}; code analysis clean"
           fi
           {
             echo "state=$state"

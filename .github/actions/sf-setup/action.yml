@@ -27,6 +27,14 @@ inputs:
     description: PEM private key (server.key), raw or base64-encoded (secret value; auth_method jwt).
     required: false
     default: ""
+  login:
+    description: "'false' to install the tooling without logging in to an org."
+    required: false
+    default: "true"
+  code-analyzer:
+    description: "'true' to also install the Salesforce Code Analyzer plugin (tooling.code_analyzer_version)."
+    required: false
+    default: "false"
 
 outputs:
   org-alias:
@@ -72,6 +80,8 @@ runs:
         NODE_MAJOR: ${{ fromJSON(steps.cfg.outputs.json).node_version }}
         SF_VERSION: ${{ fromJSON(steps.cfg.outputs.json).sf_cli_version }}
         SGD_VERSION: ${{ fromJSON(steps.cfg.outputs.json).sgd_version }}
+        CA: ${{ inputs.code-analyzer }}
+        CA_VERSION: ${{ fromJSON(steps.cfg.outputs.json).code_analyzer_version }}
       run: |
         set -euo pipefail
         {
@@ -86,7 +96,9 @@ runs:
         if ! [[ "$SF_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || ! [[ "$SGD_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
           stamp="-$(date -u +%G-%V)"
         fi
-        echo "key=sf-cli-${RUNNER_OS}-node${NODE_MAJOR}-sf${SF_VERSION}-sgd${SGD_VERSION}${stamp}" >> "$GITHUB_OUTPUT"
+        extra=""
+        if [ "$CA" = "true" ]; then extra="-ca${CA_VERSION}"; fi
+        echo "key=sf-cli-${RUNNER_OS}-node${NODE_MAJOR}-sf${SF_VERSION}-sgd${SGD_VERSION}${extra}${stamp}" >> "$GITHUB_OUTPUT"
 
     - name: Restore sf CLI cache
       id: cache
@@ -103,6 +115,8 @@ runs:
       env:
         SF_VERSION: ${{ fromJSON(steps.cfg.outputs.json).sf_cli_version }}
         SGD_VERSION: ${{ fromJSON(steps.cfg.outputs.json).sgd_version }}
+        CA: ${{ inputs.code-analyzer }}
+        CA_VERSION: ${{ fromJSON(steps.cfg.outputs.json).code_analyzer_version }}
       run: |
         set -euo pipefail
         npm install --prefix "$HOME/.sf-cli" --no-audit --no-fund --loglevel=error "@salesforce/cli@${SF_VERSION}"
@@ -111,6 +125,7 @@ runs:
         mkdir -p "$HOME/.config/sf"
         echo '["sfdx-git-delta"]' > "$HOME/.config/sf/unsignedPluginAllowList.json"
         sf plugins install "sfdx-git-delta@${SGD_VERSION}"
+        if [ "$CA" = "true" ]; then sf plugins install "code-analyzer@${CA_VERSION}"; fi
 
     - name: Verify tooling
       shell: bash
@@ -121,6 +136,7 @@ runs:
 
     - name: Log in (${{ fromJSON(steps.cfg.outputs.json).auth_method }})
       id: login
+      if: inputs.login == 'true'
       shell: bash
       env:
         SF_AUTH_URL: ${{ inputs.auth-url }}
