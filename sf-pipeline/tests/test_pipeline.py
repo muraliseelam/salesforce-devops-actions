@@ -631,6 +631,25 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaises(bootstrap.SetupError):
             bootstrap.parse_pairs(["dev"], "--org")
 
+    def test_consumer_keys_are_stable_per_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            first = bootstrap.consumer_key_for(d, "qa")
+            self.assertEqual(bootstrap.consumer_key_for(d, "qa"), first)
+            self.assertNotEqual(bootstrap.consumer_key_for(d, "int"), first)
+            self.assertTrue(first.startswith("SFPipeline") and len(first) > 40)
+
+    def test_eca_templates_render_valid_xml(self):
+        import xml.etree.ElementTree as ET
+        values = {"n": bootstrap.ECA_NAME, "cert": "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----",
+                  "consumer_key": "SFPipelineX", "profile": "System Administrator", "email": "ci@example.com"}
+        for rel, template in bootstrap.ECA_FILES.items():
+            root = ET.fromstring(template.format(**values))
+            self.assertTrue(root.tag.endswith(("ExternalClientApplication", "ExtlClntAppOauthSettings",
+                                               "ExtlClntAppGlobalOauthSettings", "ExtlClntAppOauthConfigurablePolicies")), rel)
+        policy = bootstrap.ECA_FILES["extlClntAppOauthPolicies/{n}_oauthPlcy.ecaOauthPlcy-meta.xml"].format(**values)
+        self.assertIn("<permittedUsersPolicyType>AdminApprovedPreAuthorized</permittedUsersPolicyType>", policy)
+
     def test_init_rewrites_only_the_environment_block(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "pipeline.config.yml"
