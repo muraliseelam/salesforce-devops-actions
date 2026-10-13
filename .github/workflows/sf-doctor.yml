@@ -150,25 +150,49 @@ jobs:
             echo "$line"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  pat:
-    name: PAT check
+  tokens:
+    name: Token check
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # The admin token may live only in the protected validation environment.
+    environment:
+      name: ${{ fromJSON(needs.plan.outputs.prod).validation_environment }}
     steps:
-      - name: Check the pipeline PAT
+      - name: Pipeline PAT (PRs, auto-merge)
         env:
           GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.prod).pat_secret] }}
-          PAT_SECRET: ${{ fromJSON(needs.plan.outputs.prod).pat_secret }}
+          NAME: ${{ fromJSON(needs.plan.outputs.prod).pat_secret }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error title=PAT::${PAT_SECRET} is not set (bootstrap.py secrets --pat-from-gh or --pat-stdin)"
+            echo "::error title=PAT::${NAME} is not set (bootstrap.py secrets --pat-from-gh or --pat-stdin)"
             exit 1
           fi
-          admin="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .permissions.admin)"
-          who="$(gh api user --jq .login 2>/dev/null || echo "fine-grained token")"
-          if [ "$admin" != "true" ]; then
-            echo "::error title=PAT::${PAT_SECRET} (${who}) lacks admin rights on ${GITHUB_REPOSITORY}; the env-branch sync needs Administration: write"
+          push="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .permissions.push 2>/dev/null || echo false)"
+          if [ "$push" != "true" ]; then
+            echo "::error title=PAT::${NAME} can't write to ${GITHUB_REPOSITORY} (needs Contents, Pull requests, Workflows: write)"
             exit 1
           fi
-          echo "✅ ${PAT_SECRET} works (${who}, admin on ${GITHUB_REPOSITORY})" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "✅ ${NAME} can write to ${GITHUB_REPOSITORY}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Admin token (env-branch sync)
+        env:
+          GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.prod).admin_pat_secret] }}
+          NAME: ${{ fromJSON(needs.plan.outputs.prod).admin_pat_secret }}
+          BASELINE: ${{ fromJSON(needs.plan.outputs.prod).baseline_branch }}
+          VALIDATION_ENV: ${{ fromJSON(needs.plan.outputs.prod).validation_environment }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error title=Admin token::${NAME} is not set (repository or ${VALIDATION_ENV} environment)"
+            exit 1
+          fi
+          # Reading branch protection needs Administration rights, exactly what the sync uses.
+          if ! gh api "repos/${GITHUB_REPOSITORY}/branches/${BASELINE}/protection" > /dev/null 2>"$RUNNER_TEMP/err"; then
+            if grep -q "not protected" "$RUNNER_TEMP/err"; then
+              echo "::warning title=Admin token::${BASELINE} isn't protected yet (bootstrap.py github)"
+            else
+              echo "::error title=Admin token::${NAME} can't read branch protection: $(cat "$RUNNER_TEMP/err")"
+              exit 1
+            fi
+          fi
+          echo "✅ ${NAME} can manage branch protection" | tee -a "$GITHUB_STEP_SUMMARY"
