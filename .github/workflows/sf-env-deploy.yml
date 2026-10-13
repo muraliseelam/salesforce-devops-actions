@@ -67,6 +67,7 @@ jobs:
           IS_PROD: ${{ fromJSON(steps.cfg.outputs.json).is_production }}
           BASELINE: ${{ fromJSON(steps.cfg.outputs.json).baseline_branch }}
           BRANCH: ${{ fromJSON(steps.cfg.outputs.json).branch }}
+          SOURCE_PATH: ${{ fromJSON(steps.cfg.outputs.json).source_path }}
           PUSH_SHA: ${{ github.sha }}
           PUSH_DELETED: ${{ github.event.deleted }}
           PR_STATE: ${{ github.event.pull_request.state }}
@@ -96,7 +97,16 @@ jobs:
                 sha="$(branch_sha "$BRANCH")"; pr="$(python3 "$helpers" pr-for-commit --sha "$sha")" ;;
             esac
             if [ "$run" = "true" ] && [ "$sha" = "$(branch_sha "$BASELINE")" ]; then
-              run=false; reason="${BRANCH} is at ${BASELINE} (post-release sync); nothing to deploy"
+              run=false; reason="${BRANCH} is identical to ${BASELINE} (new or just re-synced); nothing to deploy"
+            fi
+            if [ "$run" = "true" ]; then
+              # Same range the deploy uses: merge-base(baseline, sha)..sha. The compare
+              # API lists at most 300 files, so a full page counts as "changed".
+              read -r total metadata < <(gh api "repos/${GITHUB_REPOSITORY}/compare/${BASELINE}...${sha}" \
+                --jq "[(.files | length), ([.files[].filename | select(startswith(\"${SOURCE_PATH%/}/\"))] | length)] | @tsv")
+              if [ "${metadata:-0}" -eq 0 ] && [ "${total:-0}" -lt 300 ]; then
+                run=false; reason="no changes under ${SOURCE_PATH} relative to ${BASELINE}; nothing to deploy"
+              fi
             fi
           fi
           [ "$run" = "true" ] && reason="deploy ${sha:0:7} to ${BRANCH}'s org (PR ${pr:-none})"
@@ -143,7 +153,7 @@ jobs:
           python3 sf-pipeline/scripts/gh_helpers.py approval --pr "$PR" --required "$REQUIRED" --label "$LABEL" --require
 
   deploy:
-    name: Deploy ${{ needs.plan.outputs.env }}
+    name: Deploy
     needs: [plan, approval-guard]
     if: needs.plan.outputs.run == 'true'
     runs-on: ubuntu-latest

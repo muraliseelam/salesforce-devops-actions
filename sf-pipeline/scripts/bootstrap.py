@@ -128,7 +128,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(block)
         return 0
-    path.write_text(new, encoding="utf-8")
+    path.write_text(new, encoding="utf-8", newline="\n")
     cfg = pipeline_config.load(path)
     chain = cfg["promotion"]["chain"]
     print(f"Wrote {len(chain)} environments to {path}: {' -> '.join(chain)} (production: {chain[-1]})")
