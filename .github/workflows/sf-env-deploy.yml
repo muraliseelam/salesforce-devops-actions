@@ -102,8 +102,12 @@ jobs:
             if [ "$run" = "true" ]; then
               # Same range the deploy uses: merge-base(baseline, sha)..sha. The compare
               # API lists at most 300 files, so a full page counts as "changed".
-              read -r total metadata < <(gh api "repos/${GITHUB_REPOSITORY}/compare/${BASELINE}...${sha}" \
-                --jq "[(.files | length), ([.files[].filename | select(startswith(\"${SOURCE_PATH%/}/\"))] | length)] | @tsv")
+              if ! counts="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BASELINE}...${sha}" \
+                    --jq "[(.files | length), ([.files[].filename | select(startswith(\"${SOURCE_PATH%/}/\"))] | length)] | @tsv")"; then
+                echo "::warning title=SF Env Deploy::Couldn't compare ${BASELINE}...${sha:0:7}; deploying anyway (the delta step decides what changed)."
+                counts="300 1"
+              fi
+              read -r total metadata <<<"$counts"
               if [ "${metadata:-0}" -eq 0 ] && [ "${total:-0}" -lt 300 ]; then
                 run=false; reason="no changes under ${SOURCE_PATH} relative to ${BASELINE}; nothing to deploy"
               fi
@@ -175,8 +179,8 @@ jobs:
           ref: ${{ needs.plan.outputs.sha }}
           fetch-depth: 0
 
-      - name: Use pipeline files from the default branch (label deploys)
-        if: github.event_name == 'pull_request'
+      # Trusted, current pipeline code from the default branch; the env branch or PR supplies the metadata.
+      - name: Use pipeline files from the default branch
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: git checkout "origin/${DEFAULT_BRANCH}" -- .github/actions sf-pipeline

@@ -24,6 +24,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import bootstrap  # noqa: E402
 import branch_protection  # noqa: E402
+import code_analysis  # noqa: E402
 import deploy_report  # noqa: E402
 import gh_helpers  # noqa: E402
 import pipeline_config  # noqa: E402
@@ -111,6 +112,13 @@ class PipelineConfigTests(unittest.TestCase):
                 with self.assertRaises(pipeline_config.ConfigError) as ctx:
                     pipeline_config.from_dict(raw)
                 self.assertIn(needle, str(ctx.exception))
+
+    def test_non_string_env_keys_are_handled(self):
+        cfg = pipeline_config.from_dict({"environments": {"dev": {}, "prod": {}}})
+        self.assertEqual(cfg["github"]["admin_pat_secret"], "SF_PIPELINE_PAT")
+        with self.assertRaises(pipeline_config.ConfigError) as ctx:
+            pipeline_config.from_dict({"environments": {2024: {}, True: {}, "prod": {}}})
+        self.assertIn("'2024' must start with a letter", str(ctx.exception))
 
     def test_required_secrets_by_auth_method(self):
         cfg = pipeline_config.from_dict(
@@ -411,6 +419,31 @@ class DeployReportTests(unittest.TestCase):
         self.assertIn("Variable does not exist: undefinedVar", text)
         self.assertIn("classes/FxBroken.cls:1:60", text)
 
+    def test_annotations_point_at_source_lines(self):
+        src = self.dir / "force-app" / "main" / "default"
+        write(src / "classes" / "FxBroken.cls", "x")
+        write(src / "classes" / "FxFailTest.cls", "x")
+        compile_data = json.loads((FIXTURES / "validate-compile-merged.json").read_text(encoding="utf-8"))
+        test_data = json.loads((FIXTURES / "validate-testfail-merged.json").read_text(encoding="utf-8"))
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            comp = deploy_report.annotations(compile_data, "force-app")
+            tests = deploy_report.annotations(test_data, "force-app")
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(
+            comp,
+            ["::error file=force-app/main/default/classes/FxBroken.cls,line=1,col=60,title=ApexClass FxBroken::"
+             "Variable does not exist: undefinedVar"],
+        )
+        self.assertTrue(tests[0].startswith("::error file=force-app/main/default/classes/FxFailTest.cls,line=1,col=1,"))
+        self.assertIn("math is hard", tests[0])
+        # property values escape the workflow-command separators
+        weird = {"result": {"details": {"componentFailures": [
+            {"componentType": "Flow", "fullName": "a,b:c", "problem": "x: y, z"}]}}}
+        self.assertEqual(deploy_report.annotations(weird, "force-app"), ["::error title=Flow a%2Cb%3Ac::x: y, z"])
+
     def test_real_cli_error_without_details_shows_message(self):
         text, out = self.fixture_report("validate-testfail-cli.json", ["FxCalc"])
         self.assertEqual(out["status"], "failed")
@@ -534,6 +567,8 @@ class BranchProtectionTests(unittest.TestCase):
         self.assertIs(int_body["enforce_admins"], True)
         self.assertIs(int_body["required_linear_history"], True)
         self.assertIs(prod_body["required_linear_history"], False)
+        self.assertIs(int_body["required_conversation_resolution"], True)
+        self.assertIs(prod_body["required_conversation_resolution"], False)  # the release job merges itself
         # Approval is enforced by the sf-approval status (label OR reviews), not GitHub's review count.
         self.assertEqual(int_body["required_pull_request_reviews"]["required_approving_review_count"], 0)
 
@@ -578,6 +613,10 @@ class GhHelpersTests(unittest.TestCase):
         self.assertIn("add the 'approved' label", why)
         self.assertIn("1/2", why)
 
+    def test_squash_subject_pr_reference(self):
+        self.assertEqual(gh_helpers._PR_REF.search("E2E: tier service (#4)").group(1), "4")
+        self.assertIsNone(gh_helpers._PR_REF.search("Merge branch 'main' into dev"))
+
     def test_pr_marker_round_trip(self):
         body = "Release notes\n\n- change"
         once = gh_helpers.write_marker(body, "sf-release", {"sha": "abc", "job_id": "0Af1"})
@@ -587,6 +626,37 @@ class GhHelpersTests(unittest.TestCase):
         self.assertEqual(gh_helpers.read_marker(twice, "sf-release"), {"sha": "def"})
         self.assertTrue(twice.startswith("Release notes"))
         self.assertEqual(gh_helpers.read_marker("no marker", "sf-release"), {})
+
+
+class CodeAnalysisTests(unittest.TestCase):
+    DATA = json.loads((FIXTURES / "code-analyzer.json").read_text(encoding="utf-8"))
+
+    def test_real_output_engine_errors_dont_block(self):
+        result = code_analysis.analyze(self.DATA, threshold=2)
+        self.assertEqual(len(result["violations"]), 6)          # ApexDoc (Low)
+        self.assertEqual(len(result["engine_errors"]), 1)       # flow engine without Python
+        self.assertEqual(result["blocking"], [])
+        text = code_analysis.render(result, "dev", 2, "")
+        self.assertIn("<!-- sf-pipeline-analysis:dev -->", text)
+        self.assertIn("No violations at High or worse", text)
+        self.assertIn("Engine `flow` didn't run", text)
+        self.assertEqual(code_analysis.annotations(result, 2), [])  # Low findings aren't annotated
+
+    def test_threshold_blocks_and_annotates(self):
+        data = {"violations": [
+            {"rule": "ApexCRUDViolation", "engine": "pmd", "severity": 2, "primaryLocationIndex": 0,
+             "locations": [{"file": "force-app/main/default/classes/A.cls", "startLine": 7, "startColumn": 3}],
+             "message": "Validate CRUD permission before SOQL/DML operation"},
+            {"rule": "AvoidDebugStatements", "engine": "pmd", "severity": 3, "primaryLocationIndex": 0,
+             "locations": [{"file": "force-app/main/default/classes/A.cls", "startLine": 9}], "message": "Avoid debug"},
+        ]}
+        result = code_analysis.analyze(data, threshold=2)
+        self.assertEqual(len(result["blocking"]), 1)
+        notes = code_analysis.annotations(result, 2)
+        self.assertTrue(notes[0].startswith("::error file=force-app/main/default/classes/A.cls,line=7,col=3,title=High ApexCRUDViolation::"))
+        self.assertTrue(notes[1].startswith("::warning "))
+        self.assertIn("1 blocking violation", code_analysis.render(result, "dev", 2, ""))
+        self.assertEqual(code_analysis.analyze(data, threshold=1)["blocking"], [])
 
 
 class BootstrapTests(unittest.TestCase):
@@ -609,6 +679,41 @@ class BootstrapTests(unittest.TestCase):
                          {"dev": "sfp-dev", "int": "sfp-int", "qa": "x"})
         with self.assertRaises(bootstrap.SetupError):
             bootstrap.parse_pairs(["dev"], "--org")
+
+    def test_environment_settings_parse(self):
+        current = {
+            "deployment_branch_policy": {"protected_branches": True, "custom_branch_policies": False},
+            "protection_rules": [
+                {"type": "wait_timer", "wait_timer": 5},
+                {"type": "required_reviewers", "prevent_self_review": True,
+                 "reviewers": [{"type": "User", "reviewer": {"id": 42, "login": "ana"}}]},
+                {"type": "branch_policy"},
+            ],
+        }
+        policy, reviewers, other = bootstrap.environment_settings(current)
+        self.assertEqual(policy, bootstrap.PROTECTED_POLICY)
+        self.assertEqual(reviewers, [{"type": "User", "id": 42}])
+        self.assertEqual(other, {"wait_timer": 5, "prevent_self_review": True})
+        self.assertEqual(bootstrap.environment_settings({"deployment_branch_policy": None}), (None, [], {}))
+
+    def test_consumer_keys_are_stable_per_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            first = bootstrap.consumer_key_for(d, "qa")
+            self.assertEqual(bootstrap.consumer_key_for(d, "qa"), first)
+            self.assertNotEqual(bootstrap.consumer_key_for(d, "int"), first)
+            self.assertTrue(first.startswith("SFPipeline") and len(first) > 40)
+
+    def test_eca_templates_render_valid_xml(self):
+        import xml.etree.ElementTree as ET
+        values = {"n": bootstrap.ECA_NAME, "cert": "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----",
+                  "consumer_key": "SFPipelineX", "profile": "System Administrator", "email": "ci@example.com"}
+        for rel, template in bootstrap.ECA_FILES.items():
+            root = ET.fromstring(template.format(**values))
+            self.assertTrue(root.tag.endswith(("ExternalClientApplication", "ExtlClntAppOauthSettings",
+                                               "ExtlClntAppGlobalOauthSettings", "ExtlClntAppOauthConfigurablePolicies")), rel)
+        policy = bootstrap.ECA_FILES["extlClntAppOauthPolicies/{n}_oauthPlcy.ecaOauthPlcy-meta.xml"].format(**values)
+        self.assertIn("<permittedUsersPolicyType>AdminApprovedPreAuthorized</permittedUsersPolicyType>", policy)
 
     def test_init_rewrites_only_the_environment_block(self):
         with tempfile.TemporaryDirectory() as tmp:

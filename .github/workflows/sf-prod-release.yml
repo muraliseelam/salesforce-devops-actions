@@ -5,16 +5,20 @@ name: SF Prod Release
 # Phase 1, prepare (Actions > SF Prod Release > Run workflow on main, action=prepare):
 #   release/<version> from the release source env (default: the env before
 #   production) -> PR into main -> check-only validation against production ->
-#   validated job ID + SHA stored on the PR -> deploy-prod stays pending.
+#   the validated job is recorded as an `sf-release-validation` commit status
+#   (posted by github-actions, which the deploy phase verifies) -> deploy-prod
+#   stays pending, so the PR can't be merged.
 #
 # Phase 2, deploy (add the `approved` label to the release PR, or run with
-# action=deploy): quick-deploy the validated job (full-deploy fallback) ->
-# deploy-prod green -> merge with a merge commit (SHAs kept) -> tag + GitHub
-# Release -> re-sync env branches to main -> notify.
+# action=deploy): quick-deploy the validated job (full-deploy fallback only
+# when Salesforce refuses the quick deploy) -> deploy-prod green -> merge with
+# a merge commit (SHAs kept) -> tag + GitHub Release -> re-sync env branches ->
+# notify. Every step is resumable: a re-run never deploys production twice.
 #
-# The label only dispatches phase 2 onto the default branch, so production
+# The label only dispatches phase 2 onto the baseline branch, so production
 # credentials (environment secrets limited to protected branches) never run
-# next to code from a pull request.
+# next to code from a pull request. Prepare and deploy share one concurrency
+# group, so they never overlap.
 
 on:
   workflow_dispatch:
@@ -42,7 +46,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('sf-release-label-{0}', github.run_id) || format('sf-prod-release-{0}', inputs.action) }}
+  group: ${{ github.event_name == 'pull_request' && format('sf-release-label-{0}', github.run_id) || 'sf-prod-release' }}
   cancel-in-progress: false
 
 jobs:
@@ -78,7 +82,6 @@ jobs:
           STATE: ${{ github.event.pull_request.state }}
           RELEASE_PREFIX: ${{ fromJSON(steps.cfg.outputs.json).release_branch_prefix }}
           BASELINE: ${{ fromJSON(steps.cfg.outputs.json).baseline_branch }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PR: ${{ github.event.pull_request.number }}
         run: |
           if [ "$LABEL" != "$APPROVAL_LABEL" ] || [[ "$HEAD_REF" != "$RELEASE_PREFIX"* ]] \
@@ -86,9 +89,9 @@ jobs:
             echo "Not an approval of an open release PR; nothing to do."
             exit 0
           fi
-          gh workflow run sf-prod-release.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
+          gh workflow run sf-prod-release.yml --repo "$GITHUB_REPOSITORY" --ref "$BASELINE" \
             -f action=deploy -f pr="$PR"
-          echo "Dispatched SF Prod Release (deploy) for PR #${PR} on ${DEFAULT_BRANCH}"
+          echo "Dispatched SF Prod Release (deploy) for PR #${PR} on ${BASELINE}"
           echo "Approved: dispatched the production deploy for PR #${PR}." >> "$GITHUB_STEP_SUMMARY"
 
   # ------------------------------------------------------------- phase 1: prepare
@@ -165,7 +168,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Cut release branch
+      - name: Cut (or refresh) the release branch
         id: branch
         env:
           GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.cfg).pat_secret] }}
@@ -187,14 +190,21 @@ jobs:
           fi
 
           existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${RELEASE_BRANCH}" --jq .object.sha 2>/dev/null || true)"
+          open_pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$RELEASE_BRANCH" --base "$BASELINE" \
+            --state open --json number --jq '.[0].number // empty')"
           if [ -z "$existing" ]; then
             gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
               -f ref="refs/heads/${RELEASE_BRANCH}" -f sha="$src_sha" > /dev/null
             echo "Created ${RELEASE_BRANCH} at ${src_sha:0:7} from ${SOURCE_BRANCH}"
           elif [ "$existing" = "$src_sha" ]; then
             echo "Reusing ${RELEASE_BRANCH} (already at ${src_sha:0:7})"
+          elif [ -n "$open_pr" ]; then
+            # Same version, newer source (e.g. a fix was promoted): refresh the open release PR.
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${RELEASE_BRANCH}" \
+              -f sha="$src_sha" -F force=true > /dev/null
+            echo "Refreshed ${RELEASE_BRANCH}: ${existing:0:7} -> ${src_sha:0:7} (PR #${open_pr})"
           else
-            echo "::error title=SF Prod Release::${RELEASE_BRANCH} exists at ${existing:0:7}, not ${SOURCE_BRANCH}'s ${src_sha:0:7}. Use a new version."
+            echo "::error title=SF Prod Release::${RELEASE_BRANCH} exists at ${existing:0:7} without an open PR. Use a new version."
             exit 1
           fi
 
@@ -211,25 +221,31 @@ jobs:
           cat "$RUNNER_TEMP/release-notes.md" >> "$GITHUB_STEP_SUMMARY"
           echo "sha=$src_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Open release PR
+      - name: Open (or update) the release PR
         id: pr
         env:
           GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.cfg).pat_secret] }}
           BASELINE: ${{ fromJSON(needs.plan.outputs.cfg).baseline_branch }}
           RELEASE_BRANCH: ${{ needs.plan.outputs.release_branch }}
           TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
           APPROVAL_LABEL: ${{ fromJSON(needs.plan.outputs.cfg).approval_label }}
         run: |
           set -euo pipefail
+          helpers=sf-pipeline/scripts/gh_helpers.py
           url="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$RELEASE_BRANCH" --base "$BASELINE" \
             --state open --json url --jq '.[0].url // empty')"
           if [ -z "$url" ]; then
             url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASELINE" --head "$RELEASE_BRANCH" \
               --title "Release ${TAG}" --body-file "$RUNNER_TEMP/release-notes.md")"
+          else
+            gh pr edit "$url" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/release-notes.md" > /dev/null
           fi
           number="$(gh pr view "$url" --repo "$GITHUB_REPOSITORY" --json number --jq .number)"
-          # A label from an earlier validation must not approve this one.
-          python3 sf-pipeline/scripts/gh_helpers.py remove-label --pr "$number" --label "$APPROVAL_LABEL"
+          # Start clean: an approval or validation from an earlier run must not carry over.
+          python3 "$helpers" remove-label --pr "$number" --label "$APPROVAL_LABEL"
+          python3 "$helpers" pr-marker --pr "$number" --name sf-release \
+            --set "version=$VERSION" --set "tag=$TAG" --set "status=preparing" > /dev/null
           echo "Release PR: $url"
           {
             echo "url=$url"
@@ -253,6 +269,11 @@ jobs:
         with:
           ref: ${{ needs.assemble.outputs.head_sha }}
           fetch-depth: 0
+
+      - name: Use pipeline files from the baseline branch
+        env:
+          BASELINE: ${{ fromJSON(needs.plan.outputs.cfg).baseline_branch }}
+        run: git checkout "origin/${BASELINE}" -- .github/actions sf-pipeline
 
       - name: Mark deploy-prod pending
         env:
@@ -281,8 +302,8 @@ jobs:
           mode: validate
           pr-number: ${{ needs.assemble.outputs.pr }}
 
-      - name: Record validation on the release PR
-        if: always() && steps.validate.outputs.status != ''
+      - name: Record the validation
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ needs.assemble.outputs.pr }}
@@ -291,22 +312,28 @@ jobs:
           STATUS: ${{ steps.validate.outputs.status }}
           JOB_ID: ${{ steps.validate.outputs.job-id }}
           VERSION: ${{ needs.plan.outputs.version }}
-          TAG: ${{ needs.plan.outputs.tag }}
           LABEL: ${{ fromJSON(needs.plan.outputs.cfg).approval_label }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           helpers=sf-pipeline/scripts/gh_helpers.py
+          status="${STATUS:-failed}"   # no status = the validation never completed
           python3 "$helpers" pr-marker --pr "$PR" --name sf-release \
-            --set "version=$VERSION" --set "tag=$TAG" --set "sha=$SHA" \
-            --set "job_id=$JOB_ID" --set "status=$STATUS" --set "run=$RUN_URL" > /dev/null
+            --set "sha=$SHA" --set "job_id=$JOB_ID" --set "status=$status" --set "run=$RUN_URL" > /dev/null
+          # The deploy phase trusts only this status (posted by github-actions), not the editable PR body.
+          case "$status" in
+            success|skipped) vstate=success ;;
+            *)               vstate=failure ;;
+          esac
+          python3 "$helpers" set-status --sha "$SHA" --context sf-release-validation --state "$vstate" \
+            --description "job=${JOB_ID:-none} status=${status} version=${VERSION}" --target-url "$RUN_URL"
           # deploy-prod stays pending until production really has the release.
-          case "$STATUS" in
+          case "$status" in
             success) state=pending; desc="Validated against production; add the '${LABEL}' label to release"
-                     note="✅ **Validated against production** (job \`${JOB_ID}\`). Add the \`${LABEL}\` label to deploy ${TAG}." ;;
+                     note="✅ **Validated against production** (job \`${JOB_ID}\`). Add the \`${LABEL}\` label to deploy." ;;
             skipped) state=pending; desc="No deployable metadata; add the '${LABEL}' label to release"
-                     note="✅ Nothing to deploy to production metadata-wise. Add the \`${LABEL}\` label to merge and tag ${TAG}." ;;
+                     note="✅ No production metadata to deploy. Add the \`${LABEL}\` label to merge and tag the release." ;;
             *)       state=failure; desc="Release validation failed against production"
-                     note="❌ **Production validation failed.** Fix it on the source branch, promote again, then re-run *SF Prod Release* (prepare) with version \`${VERSION}\`." ;;
+                     note="❌ **Production validation failed.** Fix it on the source branch and promote again, then re-run *SF Prod Release* (prepare) with version \`${VERSION}\`. The open release PR is refreshed." ;;
           esac
           python3 "$helpers" set-status --sha "$SHA" --context "$CONTEXT" --state "$state" \
             --description "$desc" --target-url "$RUN_URL"
@@ -330,9 +357,9 @@ jobs:
           enabled: ${{ fromJSON(needs.plan.outputs.cfg).webex_enabled }}
           webhook-url: ${{ secrets[fromJSON(needs.plan.outputs.cfg).webex_secret] }}
           message: >-
-            ${{ needs.validate.outputs.status == 'failed' && '❌' || '🧪' }} **Release ${{ needs.plan.outputs.tag }}**:
+            ${{ needs.validate.result == 'success' && '🧪' || '❌' }} **Release ${{ needs.plan.outputs.tag }}**:
             production validation ${{ needs.validate.outputs.status || needs.validate.result }}.
-            ${{ needs.validate.outputs.status != 'failed' && needs.validate.result == 'success' && 'Awaiting the approval label.' || '' }}
+            ${{ needs.validate.result == 'success' && 'Awaiting the approval label.' || '' }}
             [PR](${{ needs.assemble.outputs.pr_url }}) · [Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
   # -------------------------------------------------------------- phase 2: deploy
@@ -344,6 +371,8 @@ jobs:
     outputs:
       cfg: ${{ steps.cfg.outputs.json }}
       env: ${{ steps.cfg.outputs.env }}
+      # deploy | finalize (prod already has it) | finish (merged, not tagged) | done
+      phase: ${{ steps.check.outputs.phase }}
       pr: ${{ steps.check.outputs.pr }}
       pr_url: ${{ steps.check.outputs.pr_url }}
       sha: ${{ steps.check.outputs.sha }}
@@ -369,6 +398,8 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          PAT: ${{ secrets[fromJSON(steps.cfg.outputs.json).pat_secret] }}
+          PAT_SECRET: ${{ fromJSON(steps.cfg.outputs.json).pat_secret }}
           INPUT_PR: ${{ inputs.pr }}
           BASELINE: ${{ fromJSON(steps.cfg.outputs.json).baseline_branch }}
           RELEASE_PREFIX: ${{ fromJSON(steps.cfg.outputs.json).release_branch_prefix }}
@@ -379,6 +410,7 @@ jobs:
           helpers=sf-pipeline/scripts/gh_helpers.py
           fail() { echo "::error title=SF Prod Release::$1"; echo "$1" > "$RUNNER_TEMP/reason.txt"; exit 1; }
           if [ "$GITHUB_REF_NAME" != "$BASELINE" ]; then fail "Run the deploy phase from '${BASELINE}'."; fi
+          [ -n "$PAT" ] || fail "Secret ${PAT_SECRET} is not set; it's needed to merge after deploying, so nothing was deployed."
           pr="$INPUT_PR"
           if [ -z "$pr" ]; then
             prs="$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$BASELINE" --state open --json number,headRefName \
@@ -387,32 +419,59 @@ jobs:
             pr="$prs"
           fi
           echo "pr=$pr" >> "$GITHUB_OUTPUT"
-          info="$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json state,headRefName,baseRefName,headRefOid,url)"
-          [ "$(jq -r .state <<<"$info")" = "OPEN" ] || fail "PR #${pr} is not open."
-          [[ "$(jq -r .headRefName <<<"$info")" == "$RELEASE_PREFIX"* ]] || fail "PR #${pr} is not a release PR."
-          [ "$(jq -r .baseRefName <<<"$info")" = "$BASELINE" ] || fail "PR #${pr} doesn't target ${BASELINE}."
+          info="$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json state,headRefName,baseRefName,headRefOid,url,mergeCommit)"
+          state="$(jq -r .state <<<"$info")"
           head="$(jq -r .headRefOid <<<"$info")"
           echo "pr_url=$(jq -r .url <<<"$info")" >> "$GITHUB_OUTPUT"
-
+          [[ "$(jq -r .headRefName <<<"$info")" == "$RELEASE_PREFIX"* ]] || fail "PR #${pr} is not a release PR."
+          [ "$(jq -r .baseRefName <<<"$info")" = "$BASELINE" ] || fail "PR #${pr} doesn't target ${BASELINE}."
           marker="$(python3 "$helpers" pr-marker --pr "$pr" --name sf-release)"
-          sha="$(jq -r '.sha // empty' <<<"$marker")"
-          status="$(jq -r '.status // empty' <<<"$marker")"
-          [ -n "$sha" ] || fail "PR #${pr} hasn't been validated yet; wait for SF Prod Release (prepare) to finish, then add the '${LABEL}' label again."
-          [ "$sha" = "$head" ] || fail "The release branch changed after validation (validated ${sha:0:7}, head ${head:0:7}). Re-run SF Prod Release (prepare) with the same version."
-          case "$status" in success|skipped) ;; *) fail "The last production validation of PR #${pr} was '${status}'. Fix it and re-run prepare." ;; esac
+          tag="$(jq -r '.tag // empty' <<<"$marker")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          tag_exists=false
+          if [ -n "$tag" ] && gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" > /dev/null 2>&1; then tag_exists=true; fi
+
+          if [ "$state" = "MERGED" ]; then
+            if [ "$tag_exists" = true ]; then
+              echo "phase=done" >> "$GITHUB_OUTPUT"
+              echo "PR #${pr} is already released (${tag}); nothing to do."
+              exit 0
+            fi
+            # Merged but not tagged (an earlier run stopped after the merge): finish the release.
+            echo "phase=finish" >> "$GITHUB_OUTPUT"
+            echo "sha=$(jq -r .mergeCommit.oid <<<"$info")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ "$state" = "OPEN" ] || fail "PR #${pr} is ${state,,}."
+          [ "$tag_exists" = false ] || fail "Tag ${tag} already exists."
+
+          # Production already has this exact head (an earlier run deployed it): don't deploy again.
+          if [ "$(jq -r '.deployed // empty' <<<"$marker")" = "$head" ]; then
+            {
+              echo "phase=finalize"
+              echo "sha=$head"
+            } >> "$GITHUB_OUTPUT"
+            echo "Production already has ${head:0:7}; finishing the release without redeploying."
+            exit 0
+          fi
+
+          # Trust the validation status posted by github-actions, not the editable PR body.
+          validation="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head}/statuses?per_page=100" \
+            --jq '[.[] | select(.context=="sf-release-validation" and .creator.login=="github-actions[bot]")][0] // empty')"
+          [ -n "$validation" ] || fail "PR #${pr} @ ${head:0:7} hasn't been validated; run SF Prod Release (prepare), then add the '${LABEL}' label."
+          [ "$(jq -r .state <<<"$validation")" = "success" ] || fail "The last production validation of ${head:0:7} failed; fix it and re-run prepare."
+          desc="$(jq -r .description <<<"$validation")"
+          job_id="$(sed -n 's/.*job=\([^ ]*\).*/\1/p' <<<"$desc")"; [ "$job_id" = "none" ] && job_id=""
+          status="$(sed -n 's/.*status=\([^ ]*\).*/\1/p' <<<"$desc")"
           python3 "$helpers" approval --pr "$pr" --required "$REQUIRED" --label "$LABEL" --require \
             || fail "PR #${pr} isn't approved: add the '${LABEL}' label."
-          tag="$(jq -r .tag <<<"$marker")"
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" > /dev/null 2>&1; then
-            fail "Tag ${tag} already exists."
-          fi
           {
-            echo "sha=$sha"
-            echo "tag=$tag"
-            echo "job_id=$(jq -r '.job_id // empty' <<<"$marker")"
+            echo "phase=deploy"
+            echo "sha=$head"
+            echo "job_id=$job_id"
             echo "status=$status"
           } >> "$GITHUB_OUTPUT"
-          echo "Releasing ${tag} from PR #${pr} @ ${sha:0:7} (validation ${status})"
+          echo "Releasing ${tag} from PR #${pr} @ ${head:0:7} (validation ${status}, job ${job_id:-none})"
 
       - name: Explain on the PR why nothing was deployed
         if: failure() && steps.check.outputs.pr != ''
@@ -420,15 +479,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ steps.check.outputs.pr }}
           LABEL: ${{ fromJSON(steps.cfg.outputs.json).approval_label }}
+          REQUIRED: ${{ fromJSON(steps.cfg.outputs.json).required_approvals }}
+          CONTEXT: ${{ fromJSON(steps.cfg.outputs.json).approval_status_check }}
         run: |
+          helpers=sf-pipeline/scripts/gh_helpers.py
           reason="$(cat "$RUNNER_TEMP/reason.txt" 2>/dev/null || echo "see the workflow run")"
-          # Remove the label so adding it again re-triggers the deploy.
-          python3 sf-pipeline/scripts/gh_helpers.py remove-label --pr "$PR" --label "$LABEL" || true
+          # Remove the label so adding it again re-triggers, and refresh sf-approval
+          # (a label removed by GITHUB_TOKEN fires no `unlabeled` event).
+          python3 "$helpers" remove-label --pr "$PR" --label "$LABEL" || true
+          python3 "$helpers" approval --pr "$PR" --required "$REQUIRED" --label "$LABEL" --post-status "$CONTEXT" || true
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "⛔ Not deployed: ${reason}"
 
   deploy:
     name: Deploy to production
     needs: resolve
+    if: needs.resolve.outputs.phase == 'deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 240
     environment:
@@ -448,10 +513,10 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           fetch-depth: 0
 
-      - name: Use pipeline files from the default branch
+      - name: Use pipeline files from the baseline branch
         env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: git checkout "origin/${DEFAULT_BRANCH}" -- .github/actions sf-pipeline
+          BASELINE: ${{ fromJSON(needs.resolve.outputs.cfg).baseline_branch }}
+        run: git checkout "origin/${BASELINE}" -- .github/actions sf-pipeline
 
       - name: sf CLI + org login
         uses: ./.github/actions/sf-setup
@@ -475,12 +540,20 @@ jobs:
           job-id: ${{ needs.resolve.outputs.job_id }}
           pr-number: ${{ needs.resolve.outputs.pr }}
 
+      - name: Stop if the quick deploy failed for another reason
+        if: steps.quick.outcome == 'failure' && steps.quick.outputs.error-name != 'CannotQuickDeployError'
+        env:
+          ERROR: ${{ steps.quick.outputs.error-name }}
+        run: |
+          echo "::error title=Quick deploy failed::${ERROR:-deploy error}. Not falling back to a full deploy (it may still be running in the org); check Setup > Deployment Status, then re-run."
+          exit 1
+
       - name: Explain fallback
         if: steps.quick.outcome == 'failure'
         env:
           JOB_ID: ${{ needs.resolve.outputs.job_id }}
         run: |
-          echo "::warning title=Quick deploy unavailable::Validated job ${JOB_ID} could not be quick-deployed (expired, or the org changed since validation). Deploying the same artifact in full with the same test level."
+          echo "::warning title=Quick deploy unavailable::Salesforce no longer accepts validated job ${JOB_ID} for a quick deploy (expired, or the org changed since validation). Deploying the same artifact in full with the same test level."
 
       - name: Full delta deploy
         id: full
@@ -491,9 +564,34 @@ jobs:
           mode: deploy
           pr-number: ${{ needs.resolve.outputs.pr }}
 
+      - name: Record the production deploy
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ needs.resolve.outputs.pr }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          # A re-run sees this and finalizes without deploying again.
+          python3 sf-pipeline/scripts/gh_helpers.py pr-marker --pr "$PR" --name sf-release --set "deployed=$SHA" > /dev/null
+
+      - name: Mark deploy-prod failed
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          CONTEXT: ${{ fromJSON(needs.resolve.outputs.cfg).status_check }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 sf-pipeline/scripts/gh_helpers.py set-status --sha "$SHA" --context "$CONTEXT" --state failure \
+            --description "Production deploy failed; see the run, then re-run prepare" --target-url "$RUN_URL"
+
   finalize:
     name: Merge, tag, release
     needs: [resolve, deploy]
+    if: >-
+      always() && needs.resolve.result == 'success' &&
+      (needs.deploy.result == 'success' ||
+       (needs.deploy.result == 'skipped' && (needs.resolve.outputs.phase == 'finalize' || needs.resolve.outputs.phase == 'finish')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -501,11 +599,12 @@ jobs:
       release_url: ${{ steps.release.outputs.url }}
     steps:
       - name: Mark deploy-prod success (production has the release)
+        if: needs.resolve.outputs.phase != 'finish'
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ needs.resolve.outputs.sha }}
           CONTEXT: ${{ fromJSON(needs.resolve.outputs.cfg).status_check }}
-          METHOD: ${{ needs.deploy.outputs.method }}
+          METHOD: ${{ needs.deploy.outputs.method || 'deployed earlier' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" -f state=success -f context="$CONTEXT" \
@@ -515,16 +614,30 @@ jobs:
         id: merge
         env:
           GH_TOKEN: ${{ secrets[fromJSON(needs.resolve.outputs.cfg).pat_secret] }}
+          PHASE: ${{ needs.resolve.outputs.phase }}
           PR: ${{ needs.resolve.outputs.pr }}
-          HEAD_SHA: ${{ needs.resolve.outputs.sha }}
+          SHA: ${{ needs.resolve.outputs.sha }}
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
-          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --merge --match-head-commit "$HEAD_SHA" \
-            --subject "Release ${TAG} (#${PR})"
-          sha="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json mergeCommit --jq .mergeCommit.oid)"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "Merged #${PR} as ${sha:0:7}"
+          if [ "$PHASE" = "finish" ]; then
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            echo "Already merged as ${SHA:0:7}"
+            exit 0
+          fi
+          # REST merge pinned to the deployed head. Retry: mergeability can lag the status update.
+          for attempt in 1 2 3 4 5 6; do
+            if out="$(gh api -X PUT "repos/${GITHUB_REPOSITORY}/pulls/${PR}/merge" -f merge_method=merge \
+                  -f sha="$SHA" -f commit_title="Release ${TAG} (#${PR})" --jq .sha 2>&1)"; then
+              echo "sha=$out" >> "$GITHUB_OUTPUT"
+              echo "Merged #${PR} as ${out:0:7}"
+              exit 0
+            fi
+            echo "Merge attempt ${attempt} failed: ${out}"
+            sleep 10
+          done
+          echo "::error title=Merge failed::Production HAS the release but PR #${PR} couldn't be merged (${out}). Fix the cause (e.g. unresolved conversations, PAT), then run SF Prod Release with action=deploy: it finishes without redeploying."
+          exit 1
 
       - name: Tag + GitHub Release
         id: release
@@ -533,7 +646,7 @@ jobs:
           PR: ${{ needs.resolve.outputs.pr }}
           TAG: ${{ needs.resolve.outputs.tag }}
           MERGE_SHA: ${{ steps.merge.outputs.sha }}
-          METHOD: ${{ needs.deploy.outputs.method }}
+          METHOD: ${{ needs.deploy.outputs.method || 'an earlier run' }}
         run: |
           set -euo pipefail
           {
@@ -556,7 +669,7 @@ jobs:
   notify:
     name: Notify
     needs: [resolve, deploy, finalize, sync]
-    if: always() && needs.resolve.result != 'skipped'
+    if: always() && needs.resolve.result != 'skipped' && needs.resolve.outputs.phase != 'done'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -574,7 +687,7 @@ jobs:
           DEPLOY: ${{ needs.deploy.result }}
           FINALIZE: ${{ needs.finalize.result }}
           SYNC: ${{ needs.sync.result }}
-          METHOD: ${{ needs.deploy.outputs.method }}
+          METHOD: ${{ needs.deploy.outputs.method || 'an earlier run' }}
           PR_URL: ${{ needs.resolve.outputs.pr_url }}
           RELEASE_URL: ${{ needs.finalize.outputs.release_url }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

@@ -27,6 +27,9 @@ concurrency:
 jobs:
   approval:
     name: Approval
+    # Closed/merged PRs are done; acting on them could re-post a status on a head
+    # commit that another (open) PR shares.
+    if: github.event.pull_request.state == 'open'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -61,7 +64,7 @@ jobs:
 
       - name: Post sf-approval status
         id: verdict
-        if: steps.cfg.outputs.found == 'true'
+        if: always() && steps.cfg.outputs.found == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}

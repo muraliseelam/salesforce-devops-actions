@@ -17,6 +17,13 @@
           protected branches can read them) unless --prod-repo-level is given.
           Secret values are never printed.
 
+  jwt-setup --env ENV [--org ALIAS] [--profile NAME] [--update-config] [--no-secrets]
+          Turn on JWT for an environment in one go: create a key pair (kept in
+          ~/.sf-pipeline, never in the repo), deploy a pre-authorized External
+          Client App with that certificate into the org (using your existing CLI
+          login), prove a JWT login works, then store USERNAME / CONSUMER_KEY /
+          JWT_KEY secrets. --update-config sets auth_method: jwt for the env.
+
   doctor  Check config, tools, GitHub setup and secrets; print the fix for anything missing.
 
 Common options: --repo OWNER/NAME (default: project.repository or the current gh repo),
@@ -26,10 +33,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import secrets as pysecrets
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -160,9 +171,10 @@ def ensure_repo_settings(repo: str, dry: bool) -> None:
 
 
 def ensure_labels(repo: str, cfg: dict, dry: bool) -> None:
-    existing = {lbl["name"] for lbl in gh_api(f"repos/{repo}/labels?per_page=100", paginate=True) or []}
+    # GitHub label names are case-insensitive: "Approved" already counts as "approved".
+    existing = {lbl["name"].lower() for lbl in gh_api(f"repos/{repo}/labels?per_page=100", paginate=True) or []}
     for name, (color, desc) in wanted_labels(cfg).items():
-        if name in existing:
+        if name.lower() in existing:
             say("ok", f"label {name}")
             continue
         if not dry:
@@ -188,18 +200,50 @@ def ensure_branches(repo: str, cfg: dict, dry: bool) -> None:
         say("add", f"branch {branch} (from {baseline} @ {sha[:7]})")
 
 
+PROTECTED_POLICY = {"protected_branches": True, "custom_branch_policies": False}
+
+
+def environment_settings(current: dict) -> tuple[dict | None, list[dict], dict]:
+    """(branch policy, reviewers as PUT entries, other rules) from a GET /environments/{name}."""
+    reviewers: list[dict] = []
+    other: dict = {}
+    for rule in current.get("protection_rules") or []:
+        if rule.get("type") == "required_reviewers":
+            reviewers = [{"type": r.get("type"), "id": (r.get("reviewer") or {}).get("id")} for r in rule.get("reviewers") or []]
+            if "prevent_self_review" in rule:
+                other["prevent_self_review"] = rule["prevent_self_review"]
+        elif rule.get("type") == "wait_timer":
+            other["wait_timer"] = rule.get("wait_timer", 0)
+    return current.get("deployment_branch_policy"), reviewers, other
+
+
 def ensure_environment(repo: str, name: str, protected: bool, reviewers: list[int], dry: bool) -> None:
-    current = api_optional(f"repos/{repo}/environments/{quote(name, safe='')}")
+    """Create the environment, or repair it when it exists without the required protection
+    (GitHub auto-creates environments, unprotected, the first time a job references them)."""
+    path = f"repos/{repo}/environments/{quote(name, safe='')}"
+    current = api_optional(path)
+    wanted_reviewers = [{"type": "User", "id": uid} for uid in reviewers]
     if current:
-        say("ok", f"environment {name}")
+        policy, have_reviewers, other = environment_settings(current)
+        missing = [r for r in wanted_reviewers if r["id"] not in {h["id"] for h in have_reviewers}]
+        if (not protected or policy == PROTECTED_POLICY) and not missing:
+            say("ok", f"environment {name}")
+            return
+        body: dict = dict(other)
+        body["deployment_branch_policy"] = PROTECTED_POLICY if protected else policy
+        if have_reviewers or missing:
+            body["reviewers"] = have_reviewers + missing
+        if not dry:
+            gh_api(path, method="PUT", body=body)
+        say("set", f"environment {name} (protected branches only{', reviewers' if body.get('reviewers') else ''})")
         return
-    body: dict = {}
+    body = {}
     if protected:
-        body["deployment_branch_policy"] = {"protected_branches": True, "custom_branch_policies": False}
-    if reviewers:
-        body["reviewers"] = [{"type": "User", "id": uid} for uid in reviewers]
+        body["deployment_branch_policy"] = PROTECTED_POLICY
+    if wanted_reviewers:
+        body["reviewers"] = wanted_reviewers
     if not dry:
-        gh_api(f"repos/{repo}/environments/{quote(name, safe='')}", method="PUT", body=body)
+        gh_api(path, method="PUT", body=body)
     extra = " (protected branches only" + (", reviewers" if reviewers else "") + ")" if protected else ""
     say("add", f"environment {name}{extra}")
 
@@ -295,9 +339,11 @@ def set_secret(repo: str, name: str, value: str, environment: str | None, dry: b
         cmd = [tool("gh"), "secret", "set", name, "--repo", repo]
         if environment:
             cmd += ["--env", environment]
-        proc = run(cmd, stdin=value)
+        # Bytes, not text: text-mode stdin on Windows would turn a PEM key's \n into \r\n.
+        proc = subprocess.run(cmd, input=value.encode("utf-8"), capture_output=True)
         if proc.returncode != 0:
-            raise SetupError(f"gh secret set {name} ({where}) failed: {proc.stderr.strip()}")
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise SetupError(f"gh secret set {name} ({where}) failed: {err}")
     say("set", f"{name} -> {where}")
 
 
@@ -349,6 +395,178 @@ def cmd_secrets(args: argparse.Namespace, cfg: dict, repo: str) -> int:
     else:
         say("skip", f"{pat_name} (pass --pat-from-gh or pipe a fine-grained PAT with --pat-stdin)")
     print("Next: python sf-pipeline/scripts/bootstrap.py doctor")
+    return 0
+
+
+# -------------------------------------------------------------------- jwt-setup
+
+ECA_NAME = "SF_Pipeline_CI"
+ECA_FILES = {
+    "externalClientApps/{n}.eca-meta.xml": """<?xml version="1.0" encoding="UTF-8"?>
+<ExternalClientApplication xmlns="http://soap.sforce.com/2006/04/metadata">
+    <contactEmail>{email}</contactEmail>
+    <description>Salesforce DevOps pipeline CI login (OAuth 2.0 JWT bearer flow)</description>
+    <distributionState>Local</distributionState>
+    <isProtected>false</isProtected>
+    <label>SF Pipeline CI</label>
+</ExternalClientApplication>
+""",
+    "extlClntAppOauthSettings/{n}_oauth.ecaOauth-meta.xml": """<?xml version="1.0" encoding="UTF-8"?>
+<ExtlClntAppOauthSettings xmlns="http://soap.sforce.com/2006/04/metadata">
+    <commaSeparatedOauthScopes>Api, RefreshToken</commaSeparatedOauthScopes>
+    <externalClientApplication>{n}</externalClientApplication>
+    <label>SF Pipeline CI OAuth</label>
+</ExtlClntAppOauthSettings>
+""",
+    "extlClntAppGlobalOauthSets/{n}_glbloauth.ecaGlblOauth-meta.xml": """<?xml version="1.0" encoding="UTF-8"?>
+<ExtlClntAppGlobalOauthSettings xmlns="http://soap.sforce.com/2006/04/metadata">
+    <callbackUrl>http://localhost:1717/OauthRedirect</callbackUrl>
+    <certificate>{cert}</certificate>
+    <consumerKey>{consumer_key}</consumerKey>
+    <externalClientApplication>{n}</externalClientApplication>
+    <isConsumerSecretOptional>true</isConsumerSecretOptional>
+    <isPkceRequired>false</isPkceRequired>
+    <isSecretRequiredForRefreshToken>false</isSecretRequiredForRefreshToken>
+    <label>SF Pipeline CI Global OAuth</label>
+</ExtlClntAppGlobalOauthSettings>
+""",
+    "extlClntAppOauthPolicies/{n}_oauthPlcy.ecaOauthPlcy-meta.xml": """<?xml version="1.0" encoding="UTF-8"?>
+<ExtlClntAppOauthConfigurablePolicies xmlns="http://soap.sforce.com/2006/04/metadata">
+    <commaSeparatedProfile>{profile}</commaSeparatedProfile>
+    <externalClientApplication>{n}</externalClientApplication>
+    <ipRelaxationPolicyType>Bypass</ipRelaxationPolicyType>
+    <label>SF Pipeline CI OAuth Policies</label>
+    <permittedUsersPolicyType>AdminApprovedPreAuthorized</permittedUsersPolicyType>
+</ExtlClntAppOauthConfigurablePolicies>
+""",
+}
+
+
+def key_dir(repo: str) -> Path:
+    return Path.home() / ".sf-pipeline" / repo.replace("/", "__")
+
+
+def ensure_key_pair(directory: Path, days: int) -> tuple[Path, Path]:
+    key, cert = directory / "server.key", directory / "server.crt"
+    if key.is_file() and cert.is_file():
+        say("ok", f"key pair {key}")
+        return key, cert
+    directory.mkdir(parents=True, exist_ok=True)
+    proc = run([tool("openssl"), "req", "-x509", "-sha256", "-nodes", "-days", str(days), "-newkey", "rsa:2048",
+                "-keyout", str(key), "-out", str(cert), "-subj", "/CN=sf-pipeline-ci"])
+    if proc.returncode != 0 or not key.is_file():
+        raise SetupError(f"openssl couldn't create the key pair: {proc.stderr.strip()}")
+    try:
+        os.chmod(key, 0o600)
+    except OSError:
+        pass
+    say("add", f"key pair {key} (valid {days} days; keep it out of git)")
+    return key, cert
+
+
+def consumer_key_for(directory: Path, env: str) -> str:
+    store = directory / "consumer_keys.json"
+    keys = json.loads(store.read_text(encoding="utf-8")) if store.is_file() else {}
+    if env not in keys:
+        keys[env] = f"SFPipeline{pysecrets.token_hex(24)}"
+        store.write_text(json.dumps(keys, indent=2), encoding="utf-8")
+    return keys[env]
+
+
+def deploy_eca(alias: str, cert: str, consumer_key: str, profile: str, email: str) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        project = Path(tmp)
+        (project / "sfdx-project.json").write_text(
+            json.dumps({"packageDirectories": [{"path": "eca", "default": True}], "sourceApiVersion": "64.0"}),
+            encoding="utf-8",
+        )
+        values = {"n": ECA_NAME, "cert": cert.strip(), "consumer_key": consumer_key, "profile": profile, "email": email}
+        for rel, template in ECA_FILES.items():
+            path = project / "eca" / "main" / "default" / rel.format(n=ECA_NAME)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(template.format(**values), encoding="utf-8")
+        proc = subprocess.run(
+            [tool("sf"), "project", "deploy", "start", "--source-dir", "eca", "--target-org", alias,
+             "--ignore-conflicts", "--wait", "20", "--json"],
+            cwd=project, capture_output=True, text=True, encoding="utf-8",
+        )
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        data = {}
+    result = data.get("result") or {}
+    if result.get("status") != "Succeeded":
+        failures = ((result.get("details") or {}).get("componentFailures")) or []
+        failures = failures if isinstance(failures, list) else [failures]
+        why = "; ".join(f"{f.get('fullName')}: {f.get('problem')}" for f in failures) or data.get("message") or proc.stderr
+        raise SetupError(f"deploying the External Client App to '{alias}' failed: {why}")
+    say("add", f"External Client App {ECA_NAME} in org '{alias}' (pre-authorized profile: {profile})")
+
+
+def verify_jwt(consumer_key: str, key: Path, username: str, instance_url: str, attempts: int = 8) -> None:
+    """Log in with JWT in a throwaway CLI home so your own logins are untouched."""
+    with tempfile.TemporaryDirectory() as home:
+        env = dict(os.environ, HOME=home, USERPROFILE=home, SF_USE_GENERIC_UNIX_KEYCHAIN="true",
+                   SF_DISABLE_TELEMETRY="true", SF_AUTOUPDATE_DISABLE="true")
+        message = ""
+        for attempt in range(1, attempts + 1):
+            proc = subprocess.run(
+                [tool("sf"), "org", "login", "jwt", "--client-id", consumer_key, "--jwt-key-file", str(key),
+                 "--username", username, "--instance-url", instance_url, "--json"],
+                capture_output=True, text=True, encoding="utf-8", env=env,
+            )
+            try:
+                data = json.loads(proc.stdout or "{}")
+            except ValueError:
+                data = {}
+            if data.get("status") == 0:
+                say("ok", f"JWT login as {username} ({instance_url})")
+                return
+            message = data.get("message") or proc.stderr.strip()
+            if attempt < attempts:
+                time.sleep(30)  # new apps can take a few minutes to propagate
+        raise SetupError(f"JWT login as {username} still fails after {attempts} tries: {message}")
+
+
+def cmd_jwt_setup(args: argparse.Namespace, cfg: dict, repo: str) -> int:
+    name = args.env
+    if name not in cfg["environments"]:
+        raise SetupError(f"unknown environment {name!r}")
+    env = cfg["environments"][name]
+    alias = args.org or env["org_alias"]
+    print(f"JWT setup for {name} (org alias '{alias}'){' (dry run)' if args.dry_run else ''}")
+    username = sf_username(alias)
+    directory = key_dir(repo)
+    key, cert = ensure_key_pair(directory, args.days)
+    consumer_key = consumer_key_for(directory, name)
+    if args.dry_run:
+        say("plan", f"deploy {ECA_NAME} to '{alias}', verify JWT as {username}, set 3 secrets")
+        return 0
+    deploy_eca(alias, cert.read_text(encoding="utf-8"), consumer_key, args.profile, args.email)
+    verify_jwt(consumer_key, key, username, env["instance_url"])
+    if not args.no_secrets:
+        targets: list[str | None] = (
+            [env["validation_environment"], env["github_environment"]]
+            if env["production"] and not args.prod_repo_level else [None]
+        )
+        for target in targets:
+            if target:
+                ensure_environment(repo, target, True, [], False)
+            set_secret(repo, env["secrets"]["username"], username, target, False)
+            set_secret(repo, env["secrets"]["consumer_key"], consumer_key, target, False)
+            set_secret(repo, env["secrets"]["jwt_key"], key.read_text(encoding="utf-8"), target, False)
+    if env["auth_method"] != "jwt":
+        if args.update_config:
+            path = pipeline_config.config_path(args.config)
+            text = path.read_text(encoding="utf-8")
+            new, count = re.subn(rf"(?m)^(\s+){re.escape(name)}:\s*\{{\s*\}}\s*$", rf"\1{name}: {{auth_method: jwt}}", text)
+            if count:
+                path.write_text(new, encoding="utf-8", newline="\n")
+                say("set", f"auth_method: jwt for {name} in {path.name} (commit it)")
+            else:
+                say("todo", f"add `auth_method: jwt` under environments.{name} in {path.name}")
+        else:
+            say("todo", f"set `auth_method: jwt` under environments.{name} (or re-run with --update-config)")
     return 0
 
 
@@ -409,10 +627,16 @@ def cmd_doctor(args: argparse.Namespace, cfg: dict, repo: str) -> int:
             check(need <= got, f"{name}: protection requires {', '.join(sorted(need))}", "bootstrap.py github")
         gh_envs = [env["github_environment"]] + ([env["validation_environment"]] if env["production"] else [])
         for gh_env in gh_envs:
-            present = bool(api_optional(f"repos/{repo}/environments/{quote(gh_env, safe='')}"))
+            current = api_optional(f"repos/{repo}/environments/{quote(gh_env, safe='')}")
             if env["production"]:
-                check(present, f"{name}: GitHub environment {gh_env}", "bootstrap.py github")
-            elif not present:
+                check(bool(current), f"{name}: GitHub environment {gh_env}", "bootstrap.py github")
+                if current:
+                    policy, reviewers, _ = environment_settings(current)
+                    check(policy == PROTECTED_POLICY, f"{name}: {gh_env} limited to protected branches", "bootstrap.py github")
+                    if gh_env == env["github_environment"] and not reviewers:
+                        say("warn", f"{name}: {gh_env} has no required reviewers (the approval label is the only gate); "
+                                    "add some with: bootstrap.py github --reviewer <login>")
+            elif not current:
                 say("info", f"{name}: GitHub environment {gh_env} will be created on first deploy")
 
     repo_secrets = secret_names(repo)
@@ -427,6 +651,12 @@ def cmd_doctor(args: argparse.Namespace, cfg: dict, repo: str) -> int:
         check(ok, f"{name}: secret(s) {', '.join(needed)} ({env['auth_method']})", f"bootstrap.py secrets --env {name}")
     pat = cfg["github"]["pat_secret"]
     check(pat in repo_secrets, f"PAT secret {pat}", "bootstrap.py secrets --pat-from-gh (or --pat-stdin < token.txt)")
+    admin = cfg["github"]["admin_pat_secret"]
+    if admin != pat:
+        prod = envs[pipeline_config.production_env(cfg)]
+        in_env = admin in secret_names(repo, prod["validation_environment"])
+        check(admin in repo_secrets or in_env, f"admin PAT secret {admin} (used by the env-branch sync)",
+              f"gh secret set {admin} --repo {repo} --env {prod['validation_environment']}")
     if cfg["notifications"]["webex"]["enabled"]:
         hook = cfg["notifications"]["webex"]["webhook_secret"]
         check(hook in repo_secrets, f"Webex secret {hook}", f"gh secret set {hook} --repo {repo}")
@@ -465,6 +695,16 @@ def main(argv: list[str] | None = None) -> int:
     pat.add_argument("--pat-from-gh", action="store_true", help="store your `gh auth token` as the PAT secret")
     pat.add_argument("--pat-stdin", action="store_true", help="read a fine-grained PAT from stdin")
 
+    p = sub.add_parser("jwt-setup", help="create the JWT External Client App + secrets for one env")
+    p.add_argument("--env", required=True)
+    p.add_argument("--org", help="local org alias (default: the env's org_alias)")
+    p.add_argument("--profile", default="System Administrator", help="profile pre-authorized for the app")
+    p.add_argument("--email", default="noreply@example.com", help="contact email recorded on the app")
+    p.add_argument("--days", type=int, default=730, help="certificate validity when a new key pair is created")
+    p.add_argument("--update-config", action="store_true", help="set auth_method: jwt for the env in the config")
+    p.add_argument("--no-secrets", action="store_true", help="don't write GitHub secrets")
+    p.add_argument("--prod-repo-level", action="store_true", help="store production secrets at repo level")
+
     sub.add_parser("doctor", help="check everything and print fixes")
 
     args = parser.parse_args(argv)
@@ -477,6 +717,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_github(args, cfg, repo)
         if args.command == "secrets":
             return cmd_secrets(args, cfg, repo)
+        if args.command == "jwt-setup":
+            return cmd_jwt_setup(args, cfg, repo)
         if args.command == "doctor":
             return cmd_doctor(args, cfg, repo)
     except (SetupError, pipeline_config.ConfigError, GhError) as exc:

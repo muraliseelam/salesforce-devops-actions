@@ -56,6 +56,9 @@ outputs:
   job-id:
     description: Salesforce deploy/validation job ID.
     value: ${{ steps.report.outputs.job_id }}
+  error-name:
+    description: sf CLI error name when the command failed (e.g. CannotQuickDeployError).
+    value: ${{ steps.run.outputs.error_name }}
   coverage-ok:
     description: "'true' when every changed class/trigger met coverage_threshold."
     value: ${{ steps.report.outputs.coverage_ok }}
@@ -213,11 +216,14 @@ runs:
             args+=(--coverage-formatters json-summary --results-dir "$WORK/results")
           fi
           if [ "$IGNORE_WARNINGS" = true ]; then args+=(--ignore-warnings); fi
+          # --ignore-conflicts: a fresh runner has no source-tracking state, so orgs with
+          # tracking (scratch orgs, tracked sandboxes) would otherwise fail every
+          # `deploy start` with SourceConflictError. `deploy validate` doesn't track.
           if [ "$MODE" = deploy ]; then
-            cmd=(sf project deploy start)
+            cmd=(sf project deploy start --ignore-conflicts)
           elif [ "$TEST_LEVEL" = NoTestRun ]; then
             # `deploy validate` rejects NoTestRun; a dry-run start is the check-only equivalent.
-            cmd=(sf project deploy start --dry-run)
+            cmd=(sf project deploy start --dry-run --ignore-conflicts)
           else
             cmd=(sf project deploy validate)
           fi
@@ -226,6 +232,7 @@ runs:
         "${cmd[@]}" "${args[@]}" > "$result"
         rc=$?
         echo "rc=$rc" >> "$GITHUB_OUTPUT"
+        echo "error_name=$(jq -r '.name // empty' "$result" 2>/dev/null)" >> "$GITHUB_OUTPUT"
         jq -r '"sf exit=\(.status // .exitCode) result=\(.result.status // .name // "unknown")"' "$result" 2>/dev/null || true
 
         # On failure `sf project deploy validate|start|quick --json` returns only
@@ -251,6 +258,7 @@ runs:
         MODE: ${{ inputs.mode }}
         ORG_ALIAS: ${{ fromJSON(steps.cfg.outputs.json).org_alias }}
         BASELINE: ${{ fromJSON(steps.cfg.outputs.json).baseline_branch }}
+        SOURCE_PATH: ${{ fromJSON(steps.cfg.outputs.json).source_path }}
         THRESHOLD: ${{ fromJSON(steps.cfg.outputs.json).coverage_threshold }}
         FROM_SHA: ${{ steps.delta.outputs.from }}
         TO_SHA: ${{ steps.delta.outputs.to }}
@@ -270,7 +278,8 @@ runs:
         if [ -n "$PKG" ] && [ -f "$PKG" ]; then args+=(--package "$PKG"); fi
         if [ -n "$DESTRUCTIVE" ] && [ -f "$DESTRUCTIVE" ]; then args+=(--destructive "$DESTRUCTIVE"); fi
         if [ -d "$WORK/results" ]; then args+=(--coverage-dir "$WORK/results"); fi
-        python "$GITHUB_WORKSPACE/sf-pipeline/scripts/deploy_report.py" "${args[@]}" > /dev/null
+        # --annotate puts compile errors and failing test lines on the PR's changed files.
+        python "$GITHUB_WORKSPACE/sf-pipeline/scripts/deploy_report.py" "${args[@]}" --quiet --annotate "$SOURCE_PATH"
         cat "$WORK/report.md" >> "$GITHUB_STEP_SUMMARY"
 
     - name: Comment report on PR

@@ -62,7 +62,11 @@ ENV_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,30}$")
 DEFAULTS: dict[str, Any] = {
     "project": {"source_path": "force-app", "baseline_branch": "main", "repository": ""},
     "auth": {"method": "sfdx_url"},
-    "quality": {"coverage_threshold": 75, "coverage_exempt": []},
+    "quality": {
+        "coverage_threshold": 75,
+        "coverage_exempt": [],
+        "code_analyzer": {"enabled": True, "severity_threshold": 2, "rule_selector": "Recommended"},
+    },
     "tests": {
         "require_companion": True,
         "class_patterns": ["{name}Test", "{name}_Test", "{name}Tests", "Test{name}", "Test_{name}"],
@@ -84,9 +88,15 @@ DEFAULTS: dict[str, Any] = {
         "auto_merge": True,
     },
     "deploy": {"wait_minutes": 120, "delta_output_dir": ".sgd", "ignore_warnings": False},
-    "tooling": {"node_version": "22", "sf_cli_version": "2.153.5", "sgd_version": "6.45.1"},
+    "tooling": {
+        "node_version": "22",
+        "sf_cli_version": "2.153.5",
+        "sgd_version": "6.45.1",
+        "code_analyzer_version": "5.16.0",
+    },
     "github": {
         "pat_secret": "SF_PIPELINE_PAT",
+        "admin_pat_secret": "",
         "status_check_app_id": -1,
         "labels": {"promote_prefix": "promote:", "deploy_prefix": "deploy:"},
     },
@@ -129,7 +139,9 @@ def normalize(raw: dict) -> tuple[dict, list[str]]:
         cfg["promotion"]["chain"] = []
         return cfg, errs
 
-    names = [str(n) for n in envs_raw]
+    # YAML turns keys like `2024:` or `yes:` into int/bool; key everything by its string form.
+    envs_raw = {str(k): v for k, v in envs_raw.items()}
+    names = list(envs_raw)
     for n in names:
         if not ENV_NAME.match(n):
             errs.append(f"environment name {n!r} must start with a letter and use only letters, digits, '-' or '_'")
@@ -179,6 +191,8 @@ def normalize(raw: dict) -> tuple[dict, list[str]]:
         }
     cfg["environments"] = envs
     cfg["promotion"]["chain"] = names
+    if not cfg["github"].get("admin_pat_secret"):
+        cfg["github"]["admin_pat_secret"] = cfg["github"]["pat_secret"]
     if not cfg["release"].get("source_env"):
         cfg["release"]["source_env"] = names[-2]
     return cfg, errs
@@ -258,6 +272,12 @@ def validate(cfg: dict, repo_root: Path | None = None) -> list[str]:
     exempt = quality.get("coverage_exempt")
     if not isinstance(exempt, list) or not all(isinstance(c, str) for c in exempt):
         errs.append("quality.coverage_exempt must be a list of class names")
+    analyzer = quality.get("code_analyzer") if isinstance(quality.get("code_analyzer"), dict) else {}
+    need_bool(analyzer, "enabled", "quality.code_analyzer")
+    sev = analyzer.get("severity_threshold")
+    if not is_int(sev) or not 1 <= sev <= 5:
+        errs.append("quality.code_analyzer.severity_threshold must be 1 (Critical) .. 5 (Info)")
+    need_str(analyzer, "rule_selector", "quality.code_analyzer")
 
     tests = cfg["tests"]
     need_bool(tests, "require_companion", "tests")
@@ -289,11 +309,12 @@ def validate(cfg: dict, repo_root: Path | None = None) -> list[str]:
     need_str(deploy, "delta_output_dir", "deploy")
     need_bool(deploy, "ignore_warnings", "deploy")
 
-    for key in ("node_version", "sf_cli_version", "sgd_version"):
+    for key in ("node_version", "sf_cli_version", "sgd_version", "code_analyzer_version"):
         need_str(cfg["tooling"], key, "tooling")
 
     github = cfg["github"]
     need_str(github, "pat_secret", "github")
+    need_str(github, "admin_pat_secret", "github")
     if not is_int(github.get("status_check_app_id")):
         errs.append("github.status_check_app_id must be an integer (-1 = any source)")
     labels = github.get("labels") or {}
@@ -418,7 +439,12 @@ def globals_view(cfg: dict) -> dict[str, str]:
         "node_version": _s(cfg["tooling"]["node_version"]),
         "sf_cli_version": _s(cfg["tooling"]["sf_cli_version"]),
         "sgd_version": _s(cfg["tooling"]["sgd_version"]),
+        "code_analyzer_version": _s(cfg["tooling"]["code_analyzer_version"]),
+        "code_analyzer_enabled": _s(cfg["quality"]["code_analyzer"]["enabled"]),
+        "code_analyzer_threshold": _s(cfg["quality"]["code_analyzer"]["severity_threshold"]),
+        "code_analyzer_rules": _s(cfg["quality"]["code_analyzer"]["rule_selector"]),
         "pat_secret": _s(github["pat_secret"]),
+        "admin_pat_secret": _s(github["admin_pat_secret"]),
         "status_check_app_id": _s(github["status_check_app_id"]),
         "promote_label_prefix": _s(labels["promote_prefix"]),
         "deploy_label_prefix": _s(labels["deploy_prefix"]),

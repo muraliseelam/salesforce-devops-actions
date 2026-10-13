@@ -49,9 +49,11 @@ jobs:
             .github/actions
             sf-pipeline
 
-      - name: Load config
+      - name: Load production config
         id: cfg
         uses: ./.github/actions/load-config
+        with:
+          production: "true"
 
       - name: Environments to sync
         id: envs
@@ -66,6 +68,10 @@ jobs:
     if: needs.plan.outputs.envs != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Runs in the production validation environment (protected branches only), so an
+    # admin-capable token can live there instead of in repository secrets.
+    environment:
+      name: ${{ fromJSON(needs.plan.outputs.cfg).validation_environment }}
     strategy:
       fail-fast: false
       matrix:
@@ -73,8 +79,8 @@ jobs:
     steps:
       - name: Check PAT
         env:
-          PAT: ${{ secrets[fromJSON(needs.plan.outputs.cfg).pat_secret] }}
-          PAT_SECRET: ${{ fromJSON(needs.plan.outputs.cfg).pat_secret }}
+          PAT: ${{ secrets[fromJSON(needs.plan.outputs.cfg).admin_pat_secret] }}
+          PAT_SECRET: ${{ fromJSON(needs.plan.outputs.cfg).admin_pat_secret }}
         run: |
           if [ -z "$PAT" ]; then
             echo "::error title=Sync::Secret ${PAT_SECRET} is not set (needs administration + contents + workflows write)."
@@ -86,7 +92,7 @@ jobs:
         with:
           ref: ${{ fromJSON(needs.plan.outputs.cfg).baseline_branch }}
           fetch-depth: 0
-          token: ${{ secrets[fromJSON(needs.plan.outputs.cfg).pat_secret] }}
+          token: ${{ secrets[fromJSON(needs.plan.outputs.cfg).admin_pat_secret] }}
 
       - name: Load config
         id: cfg
@@ -134,7 +140,7 @@ jobs:
         id: snapshot
         if: steps.inspect.outputs.action == 'sync' && !inputs.dry_run
         env:
-          GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.cfg).pat_secret] }}
+          GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.cfg).admin_pat_secret] }}
           BRANCH: ${{ fromJSON(steps.cfg.outputs.json).branch }}
         run: |
           set -euo pipefail
@@ -156,7 +162,7 @@ jobs:
       - name: Lift protection
         if: steps.snapshot.outputs.protected == 'true'
         env:
-          GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.cfg).pat_secret] }}
+          GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.cfg).admin_pat_secret] }}
           BRANCH: ${{ fromJSON(steps.cfg.outputs.json).branch }}
         run: python sf-pipeline/scripts/branch_protection.py lift --branch "$BRANCH"
 
@@ -174,7 +180,7 @@ jobs:
       - name: Restore branch protection (always)
         if: always() && steps.snapshot.outputs.protected == 'true'
         env:
-          GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.cfg).pat_secret] }}
+          GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.cfg).admin_pat_secret] }}
           BRANCH: ${{ fromJSON(steps.cfg.outputs.json).branch }}
           FILE: ${{ steps.snapshot.outputs.file }}
         run: |

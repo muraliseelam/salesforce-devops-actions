@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -104,14 +105,25 @@ def set_status(repo: str, sha: str, context: str, state: str, description: str, 
     gh_api(f"repos/{repo}/statuses/{sha}", method="POST", body=payload)
 
 
-def pr_for_commit(repo: str, sha: str) -> int | None:
-    prs = gh_api(f"repos/{repo}/commits/{sha}/pulls?per_page=100", paginate=True) or []
-    for pr in prs:
-        if pr.get("merge_commit_sha") == sha:
-            return int(pr["number"])
-    merged = [pr for pr in prs if pr.get("merged_at")]
-    pick = merged[0] if merged else (prs[0] if prs else None)
-    return int(pick["number"]) if pick else None
+_PR_REF = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def pr_for_commit(repo: str, sha: str, attempts: int = 6, delay: float = 5.0) -> int | None:
+    """PR that introduced a commit. GitHub can take a few seconds after a merge to
+    link the commit, so retry, then fall back to the "(#N)" of a squash subject."""
+    for attempt in range(attempts):
+        prs = gh_api(f"repos/{repo}/commits/{sha}/pulls?per_page=100", paginate=True) or []
+        for pr in prs:
+            if pr.get("merge_commit_sha") == sha:
+                return int(pr["number"])
+        merged = [pr for pr in prs if pr.get("merged_at")]
+        if merged:
+            return int(merged[0]["number"])
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    subject = ((gh_api(f"repos/{repo}/commits/{sha}").get("commit") or {}).get("message") or "").splitlines()
+    match = _PR_REF.search(subject[0]) if subject else None
+    return int(match.group(1)) if match else None
 
 
 def latest_approvers(reviews: list[dict], author: str) -> list[str]:
