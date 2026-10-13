@@ -411,6 +411,27 @@ class DeployReportTests(unittest.TestCase):
         self.assertIn("Variable does not exist: undefinedVar", text)
         self.assertIn("classes/FxBroken.cls:1:60", text)
 
+    def test_annotations_point_at_source_lines(self):
+        src = self.dir / "force-app" / "main" / "default"
+        write(src / "classes" / "FxBroken.cls", "x")
+        write(src / "classes" / "FxFailTest.cls", "x")
+        compile_data = json.loads((FIXTURES / "validate-compile-merged.json").read_text(encoding="utf-8"))
+        test_data = json.loads((FIXTURES / "validate-testfail-merged.json").read_text(encoding="utf-8"))
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            comp = deploy_report.annotations(compile_data, "force-app")
+            tests = deploy_report.annotations(test_data, "force-app")
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(
+            comp,
+            ["::error file=force-app/main/default/classes/FxBroken.cls,line=1,col=60,title=ApexClass FxBroken::"
+             "Variable does not exist: undefinedVar"],
+        )
+        self.assertTrue(tests[0].startswith("::error file=force-app/main/default/classes/FxFailTest.cls,line=1,col=1,"))
+        self.assertIn("math is hard", tests[0])
+
     def test_real_cli_error_without_details_shows_message(self):
         text, out = self.fixture_report("validate-testfail-cli.json", ["FxCalc"])
         self.assertEqual(out["status"], "failed")

@@ -161,11 +161,32 @@ jobs:
           jwt-key: ${{ secrets[fromJSON(needs.plan.outputs.cfg).jwt_key_secret] }}
 
       - name: Delta validate
+        id: validate
         uses: ./.github/actions/deploy
         with:
           environment: ${{ needs.plan.outputs.env }}
           mode: validate
           pr-number: ${{ github.event.pull_request.number }}
+
+      - name: Report a failed org login on the PR
+        if: failure() && steps.validate.outcome == 'skipped'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ENV_NAME: ${{ needs.plan.outputs.env }}
+          AUTH: ${{ fromJSON(needs.plan.outputs.cfg).auth_method }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          marker="<!-- sf-pipeline-report:${ENV_NAME}:validate -->"
+          {
+            echo "$marker"
+            echo "## 🚀 Salesforce Pipeline Report"
+            echo
+            echo "❌ **Couldn't log in to the \`${ENV_NAME}\` org** (${AUTH}), so nothing was validated. The [workflow run](${RUN_URL}) names the missing or rejected secret."
+            echo
+            echo "Usually a secret is missing or expired: run \`python sf-pipeline/scripts/bootstrap.py secrets --env ${ENV_NAME}\`, then the *SF Pipeline Doctor* workflow, then re-run this check."
+          } > "$RUNNER_TEMP/login.md"
+          python3 sf-pipeline/scripts/gh_helpers.py upsert-comment --pr "$PR_NUMBER" --marker "$marker" --body-file "$RUNNER_TEMP/login.md"
 
   gate:
     name: Gate
@@ -197,7 +218,7 @@ jobs:
           elif [ "$VALIDATE" = "success" ]; then
             state=success; desc="Check-only validation passed on ${ORG_ALIAS}"
           else
-            state=failure; desc="Check-only validation ${VALIDATE} on ${ORG_ALIAS}"
+            state=failure; desc="Check-only validation against ${ORG_ALIAS} did not pass (${VALIDATE})"
           fi
           {
             echo "state=$state"

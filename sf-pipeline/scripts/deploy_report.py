@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -250,7 +251,8 @@ def build(args: argparse.Namespace) -> tuple[str, dict[str, str]]:
         gate = "➖ not evaluated (no Apex tests ran)"
     summary_rows.append(("Coverage gate", gate))
     if job_id:
-        summary_rows.append(("Job ID", f"`{job_id}`"))
+        url = result.get("deployUrl") or ""
+        summary_rows.append(("Job ID", f"[`{job_id}`]({url})" if url.startswith("https://") else f"`{job_id}`"))
 
     passed = deploy_success and outputs["coverage_ok"] == "true"
     outputs["passed"] = "true" if passed else "false"
@@ -331,6 +333,53 @@ def build(args: argparse.Namespace) -> tuple[str, dict[str, str]]:
     return finish(out, args), outputs
 
 
+_FRAME = re.compile(r"(Class|Trigger)\.(?:(\w+)__)?(\w+)(?:\.[\w.]+)?: line (\d+), column (\d+)")
+
+
+def _find_source(source_path: str, rel_name: str) -> str | None:
+    """Repo-relative path of a metadata file such as 'classes/Foo.cls' under source_path."""
+    root = Path(source_path)
+    name = Path(rel_name.replace("\\", "/")).name
+    suffix = "/" + rel_name.replace("\\", "/").lstrip("/")
+    matches = [p for p in root.rglob(name) if p.is_file()]
+    exact = [p for p in matches if p.as_posix().endswith(suffix)]
+    pick = (exact or matches or [None])[0]
+    return pick.as_posix() if pick else None
+
+
+def annotations(data: dict | None, source_path: str) -> list[str]:
+    """::error annotations that point at the failing source lines in the PR diff."""
+    if not data:
+        return []
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    details = result.get("details") if isinstance(result.get("details"), dict) else {}
+    run_tests = details.get("runTestResult") if isinstance(details.get("runTestResult"), dict) else {}
+    out: list[str] = []
+
+    def esc(text: Any) -> str:
+        return str(text or "").replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+
+    for f in as_list(details.get("componentFailures")):
+        path = _find_source(source_path, f.get("fileName") or "") if f.get("fileName") else None
+        title = esc(f"{f.get('componentType')} {f.get('fullName')}")
+        loc = f"file={path}" if path else ""
+        if path and f.get("lineNumber"):
+            loc += f",line={f.get('lineNumber')}" + (f",col={f.get('columnNumber')}" if f.get("columnNumber") else "")
+        out.append(f"::error {loc + ',' if loc else ''}title={title}::{esc(f.get('problem'))}")
+
+    for f in as_list(run_tests.get("failures")):
+        title = esc(f"Apex test {f.get('name')}.{f.get('methodName')}")
+        frame = _FRAME.search(f.get("stackTrace") or "")
+        loc = ""
+        if frame:
+            kind, _ns, name, line, col = frame.groups()
+            path = _find_source(source_path, f"{'classes' if kind == 'Class' else 'triggers'}/{name}.{'cls' if kind == 'Class' else 'trigger'}")
+            if path:
+                loc = f"file={path},line={line},col={col},"
+        out.append(f"::error {loc}title={title}::{esc(f.get('message'))}")
+    return out
+
+
 def finish(lines: list[str], args: argparse.Namespace) -> str:
     footer = []
     if args.run_url:
@@ -363,13 +412,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-url", default="")
     parser.add_argument("--output", required=True)
     parser.add_argument("--github-output", action="store_true")
+    parser.add_argument("--annotate", metavar="SOURCE_PATH", help="emit ::error annotations on failing source lines")
+    parser.add_argument("--quiet", action="store_true", help="don't echo the report to stdout")
     args = parser.parse_args(argv)
 
     text, outputs = build(args)
     Path(args.output).write_text(text, encoding="utf-8")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    print(text)
+    if not args.quiet:
+        print(text)
+    if args.annotate:
+        for line in annotations(load_json(args.result), args.annotate):
+            print(line)
     if args.github_output:
         target = os.environ.get("GITHUB_OUTPUT")
         if not target:
