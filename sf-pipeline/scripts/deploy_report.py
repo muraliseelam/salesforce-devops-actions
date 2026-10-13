@@ -359,16 +359,20 @@ def annotations(data: dict | None, source_path: str) -> list[str]:
     def esc(text: Any) -> str:
         return str(text or "").replace("%", "%25").replace("\r", "").replace("\n", "%0A")
 
+    def esc_prop(text: Any) -> str:
+        # Property values (file=, title=) must also escape the separators ',' and ':'.
+        return esc(text).replace(":", "%3A").replace(",", "%2C")
+
     for f in as_list(details.get("componentFailures")):
         path = _find_source(source_path, f.get("fileName") or "") if f.get("fileName") else None
-        title = esc(f"{f.get('componentType')} {f.get('fullName')}")
+        title = esc_prop(f"{f.get('componentType')} {f.get('fullName')}")
         loc = f"file={path}" if path else ""
         if path and f.get("lineNumber"):
             loc += f",line={f.get('lineNumber')}" + (f",col={f.get('columnNumber')}" if f.get("columnNumber") else "")
         out.append(f"::error {loc + ',' if loc else ''}title={title}::{esc(f.get('problem'))}")
 
     for f in as_list(run_tests.get("failures")):
-        title = esc(f"Apex test {f.get('name')}.{f.get('methodName')}")
+        title = esc_prop(f"Apex test {f.get('name')}.{f.get('methodName')}")
         frame = _FRAME.search(f.get("stackTrace") or "")
         loc = ""
         if frame:

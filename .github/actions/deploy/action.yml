@@ -56,6 +56,9 @@ outputs:
   job-id:
     description: Salesforce deploy/validation job ID.
     value: ${{ steps.report.outputs.job_id }}
+  error-name:
+    description: sf CLI error name when the command failed (e.g. CannotQuickDeployError).
+    value: ${{ steps.run.outputs.error_name }}
   coverage-ok:
     description: "'true' when every changed class/trigger met coverage_threshold."
     value: ${{ steps.report.outputs.coverage_ok }}
@@ -229,6 +232,7 @@ runs:
         "${cmd[@]}" "${args[@]}" > "$result"
         rc=$?
         echo "rc=$rc" >> "$GITHUB_OUTPUT"
+        echo "error_name=$(jq -r '.name // empty' "$result" 2>/dev/null)" >> "$GITHUB_OUTPUT"
         jq -r '"sf exit=\(.status // .exitCode) result=\(.result.status // .name // "unknown")"' "$result" 2>/dev/null || true
 
         # On failure `sf project deploy validate|start|quick --json` returns only

@@ -87,6 +87,7 @@ DEFAULTS: dict[str, Any] = {
     "tooling": {"node_version": "22", "sf_cli_version": "2.153.5", "sgd_version": "6.45.1"},
     "github": {
         "pat_secret": "SF_PIPELINE_PAT",
+        "admin_pat_secret": "",
         "status_check_app_id": -1,
         "labels": {"promote_prefix": "promote:", "deploy_prefix": "deploy:"},
     },
@@ -129,7 +130,9 @@ def normalize(raw: dict) -> tuple[dict, list[str]]:
         cfg["promotion"]["chain"] = []
         return cfg, errs
 
-    names = [str(n) for n in envs_raw]
+    # YAML turns keys like `2024:` or `yes:` into int/bool; key everything by its string form.
+    envs_raw = {str(k): v for k, v in envs_raw.items()}
+    names = list(envs_raw)
     for n in names:
         if not ENV_NAME.match(n):
             errs.append(f"environment name {n!r} must start with a letter and use only letters, digits, '-' or '_'")
@@ -179,6 +182,8 @@ def normalize(raw: dict) -> tuple[dict, list[str]]:
         }
     cfg["environments"] = envs
     cfg["promotion"]["chain"] = names
+    if not cfg["github"].get("admin_pat_secret"):
+        cfg["github"]["admin_pat_secret"] = cfg["github"]["pat_secret"]
     if not cfg["release"].get("source_env"):
         cfg["release"]["source_env"] = names[-2]
     return cfg, errs
@@ -294,6 +299,7 @@ def validate(cfg: dict, repo_root: Path | None = None) -> list[str]:
 
     github = cfg["github"]
     need_str(github, "pat_secret", "github")
+    need_str(github, "admin_pat_secret", "github")
     if not is_int(github.get("status_check_app_id")):
         errs.append("github.status_check_app_id must be an integer (-1 = any source)")
     labels = github.get("labels") or {}
@@ -419,6 +425,7 @@ def globals_view(cfg: dict) -> dict[str, str]:
         "sf_cli_version": _s(cfg["tooling"]["sf_cli_version"]),
         "sgd_version": _s(cfg["tooling"]["sgd_version"]),
         "pat_secret": _s(github["pat_secret"]),
+        "admin_pat_secret": _s(github["admin_pat_secret"]),
         "status_check_app_id": _s(github["status_check_app_id"]),
         "promote_label_prefix": _s(labels["promote_prefix"]),
         "deploy_label_prefix": _s(labels["deploy_prefix"]),

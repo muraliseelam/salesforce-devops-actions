@@ -5,7 +5,10 @@ name: SF PR Validation
 #   plan -> preflight (routing, meta pairs, branch origin, change detection)
 #        -> validate (sf project deploy validate) -> gate (deploy-<env> status)
 # Base branches are resolved from sf-pipeline/pipeline.config.yml, so the
-# trigger accepts every PR and the plan job routes it.
+# trigger accepts every PR and the plan job routes it. The config, scripts and
+# composite actions always come from the default branch (trusted, and current
+# even for promotion PRs whose head predates a config change); the PR supplies
+# only the metadata being validated.
 
 on:
   pull_request:
@@ -31,10 +34,10 @@ jobs:
       env: ${{ steps.cfg.outputs.env }}
       cfg: ${{ steps.cfg.outputs.json }}
     steps:
-      - name: Checkout pipeline files
+      - name: Checkout pipeline files (default branch)
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: |
             .github/actions
@@ -99,6 +102,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Use pipeline files from the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: git checkout "origin/${DEFAULT_BRANCH}" -- .github/actions sf-pipeline
+
       - name: Load config
         id: cfg
         uses: ./.github/actions/load-config
@@ -151,6 +159,11 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
+      - name: Use pipeline files from the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: git checkout "origin/${DEFAULT_BRANCH}" -- .github/actions sf-pipeline
+
       - name: sf CLI + JWT auth
         uses: ./.github/actions/sf-setup
         with:
@@ -195,10 +208,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Checkout pipeline scripts
+      - name: Checkout pipeline scripts (default branch)
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: sf-pipeline
 

@@ -150,7 +150,8 @@ def desired_protection(cfg: dict, env_name: str) -> dict:
         "allow_force_pushes": False,
         "allow_deletions": False,
         "block_creations": False,
-        "required_conversation_resolution": True,
+        # Not on production: the release workflow merges the release PR itself.
+        "required_conversation_resolution": not production,
         "lock_branch": False,
         "allow_fork_syncing": False,
     }

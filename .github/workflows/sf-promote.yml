@@ -135,12 +135,17 @@ jobs:
             # Leave the branch alone: it may carry a conflict resolution.
             echo "Promotion PR already open: $url"
           else
-            # Pin the promotion branch to the exact head SHA that was merged before
-            # (resetting a leftover branch from a closed promotion PR).
+            # The branch is the exact content that was merged before, plus an empty
+            # "promote" commit: each promotion PR gets its own head SHA, so its
+            # sf-approval / deploy-<env> statuses can't leak to or from another PR.
+            tree="$(gh api "repos/${repo}/git/commits/${HEAD_SHA}" --jq .tree.sha)"
+            promo="$(gh api -X POST "repos/${repo}/git/commits" -f message="Promote #${PR} to ${TARGET_ENV}" \
+              -f tree="$tree" -f "parents[]=${HEAD_SHA}" --jq .sha)"
+            # Reset a leftover branch from a closed promotion PR, or create it.
             if gh api "repos/${repo}/git/ref/heads/${branch}" > /dev/null 2>&1; then
-              gh api -X PATCH "repos/${repo}/git/refs/heads/${branch}" -f sha="$HEAD_SHA" -F force=true > /dev/null
+              gh api -X PATCH "repos/${repo}/git/refs/heads/${branch}" -f sha="$promo" -F force=true > /dev/null
             else
-              gh api -X POST "repos/${repo}/git/refs" -f ref="refs/heads/${branch}" -f sha="$HEAD_SHA" > /dev/null
+              gh api -X POST "repos/${repo}/git/refs" -f ref="refs/heads/${branch}" -f sha="$promo" > /dev/null
             fi
             title="$TITLE"
             while [[ "$title" == "[promote → "*"] "* ]]; do title="${title#*] }"; done

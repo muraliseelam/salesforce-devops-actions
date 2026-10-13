@@ -171,9 +171,10 @@ def ensure_repo_settings(repo: str, dry: bool) -> None:
 
 
 def ensure_labels(repo: str, cfg: dict, dry: bool) -> None:
-    existing = {lbl["name"] for lbl in gh_api(f"repos/{repo}/labels?per_page=100", paginate=True) or []}
+    # GitHub label names are case-insensitive: "Approved" already counts as "approved".
+    existing = {lbl["name"].lower() for lbl in gh_api(f"repos/{repo}/labels?per_page=100", paginate=True) or []}
     for name, (color, desc) in wanted_labels(cfg).items():
-        if name in existing:
+        if name.lower() in existing:
             say("ok", f"label {name}")
             continue
         if not dry:
@@ -199,18 +200,50 @@ def ensure_branches(repo: str, cfg: dict, dry: bool) -> None:
         say("add", f"branch {branch} (from {baseline} @ {sha[:7]})")
 
 
+PROTECTED_POLICY = {"protected_branches": True, "custom_branch_policies": False}
+
+
+def environment_settings(current: dict) -> tuple[dict | None, list[dict], dict]:
+    """(branch policy, reviewers as PUT entries, other rules) from a GET /environments/{name}."""
+    reviewers: list[dict] = []
+    other: dict = {}
+    for rule in current.get("protection_rules") or []:
+        if rule.get("type") == "required_reviewers":
+            reviewers = [{"type": r.get("type"), "id": (r.get("reviewer") or {}).get("id")} for r in rule.get("reviewers") or []]
+            if "prevent_self_review" in rule:
+                other["prevent_self_review"] = rule["prevent_self_review"]
+        elif rule.get("type") == "wait_timer":
+            other["wait_timer"] = rule.get("wait_timer", 0)
+    return current.get("deployment_branch_policy"), reviewers, other
+
+
 def ensure_environment(repo: str, name: str, protected: bool, reviewers: list[int], dry: bool) -> None:
-    current = api_optional(f"repos/{repo}/environments/{quote(name, safe='')}")
+    """Create the environment, or repair it when it exists without the required protection
+    (GitHub auto-creates environments, unprotected, the first time a job references them)."""
+    path = f"repos/{repo}/environments/{quote(name, safe='')}"
+    current = api_optional(path)
+    wanted_reviewers = [{"type": "User", "id": uid} for uid in reviewers]
     if current:
-        say("ok", f"environment {name}")
+        policy, have_reviewers, other = environment_settings(current)
+        missing = [r for r in wanted_reviewers if r["id"] not in {h["id"] for h in have_reviewers}]
+        if (not protected or policy == PROTECTED_POLICY) and not missing:
+            say("ok", f"environment {name}")
+            return
+        body: dict = dict(other)
+        body["deployment_branch_policy"] = PROTECTED_POLICY if protected else policy
+        if have_reviewers or missing:
+            body["reviewers"] = have_reviewers + missing
+        if not dry:
+            gh_api(path, method="PUT", body=body)
+        say("set", f"environment {name} (protected branches only{', reviewers' if body.get('reviewers') else ''})")
         return
-    body: dict = {}
+    body = {}
     if protected:
-        body["deployment_branch_policy"] = {"protected_branches": True, "custom_branch_policies": False}
-    if reviewers:
-        body["reviewers"] = [{"type": "User", "id": uid} for uid in reviewers]
+        body["deployment_branch_policy"] = PROTECTED_POLICY
+    if wanted_reviewers:
+        body["reviewers"] = wanted_reviewers
     if not dry:
-        gh_api(f"repos/{repo}/environments/{quote(name, safe='')}", method="PUT", body=body)
+        gh_api(path, method="PUT", body=body)
     extra = " (protected branches only" + (", reviewers" if reviewers else "") + ")" if protected else ""
     say("add", f"environment {name}{extra}")
 
@@ -306,9 +339,11 @@ def set_secret(repo: str, name: str, value: str, environment: str | None, dry: b
         cmd = [tool("gh"), "secret", "set", name, "--repo", repo]
         if environment:
             cmd += ["--env", environment]
-        proc = run(cmd, stdin=value)
+        # Bytes, not text: text-mode stdin on Windows would turn a PEM key's \n into \r\n.
+        proc = subprocess.run(cmd, input=value.encode("utf-8"), capture_output=True)
         if proc.returncode != 0:
-            raise SetupError(f"gh secret set {name} ({where}) failed: {proc.stderr.strip()}")
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise SetupError(f"gh secret set {name} ({where}) failed: {err}")
     say("set", f"{name} -> {where}")
 
 
@@ -592,10 +627,16 @@ def cmd_doctor(args: argparse.Namespace, cfg: dict, repo: str) -> int:
             check(need <= got, f"{name}: protection requires {', '.join(sorted(need))}", "bootstrap.py github")
         gh_envs = [env["github_environment"]] + ([env["validation_environment"]] if env["production"] else [])
         for gh_env in gh_envs:
-            present = bool(api_optional(f"repos/{repo}/environments/{quote(gh_env, safe='')}"))
+            current = api_optional(f"repos/{repo}/environments/{quote(gh_env, safe='')}")
             if env["production"]:
-                check(present, f"{name}: GitHub environment {gh_env}", "bootstrap.py github")
-            elif not present:
+                check(bool(current), f"{name}: GitHub environment {gh_env}", "bootstrap.py github")
+                if current:
+                    policy, reviewers, _ = environment_settings(current)
+                    check(policy == PROTECTED_POLICY, f"{name}: {gh_env} limited to protected branches", "bootstrap.py github")
+                    if gh_env == env["github_environment"] and not reviewers:
+                        say("warn", f"{name}: {gh_env} has no required reviewers (the approval label is the only gate); "
+                                    "add some with: bootstrap.py github --reviewer <login>")
+            elif not current:
                 say("info", f"{name}: GitHub environment {gh_env} will be created on first deploy")
 
     repo_secrets = secret_names(repo)
@@ -610,6 +651,12 @@ def cmd_doctor(args: argparse.Namespace, cfg: dict, repo: str) -> int:
         check(ok, f"{name}: secret(s) {', '.join(needed)} ({env['auth_method']})", f"bootstrap.py secrets --env {name}")
     pat = cfg["github"]["pat_secret"]
     check(pat in repo_secrets, f"PAT secret {pat}", "bootstrap.py secrets --pat-from-gh (or --pat-stdin < token.txt)")
+    admin = cfg["github"]["admin_pat_secret"]
+    if admin != pat:
+        prod = envs[pipeline_config.production_env(cfg)]
+        in_env = admin in secret_names(repo, prod["validation_environment"])
+        check(admin in repo_secrets or in_env, f"admin PAT secret {admin} (used by the env-branch sync)",
+              f"gh secret set {admin} --repo {repo} --env {prod['validation_environment']}")
     if cfg["notifications"]["webex"]["enabled"]:
         hook = cfg["notifications"]["webex"]["webhook_secret"]
         check(hook in repo_secrets, f"Webex secret {hook}", f"gh secret set {hook} --repo {repo}")

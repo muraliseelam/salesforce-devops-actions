@@ -112,6 +112,13 @@ class PipelineConfigTests(unittest.TestCase):
                     pipeline_config.from_dict(raw)
                 self.assertIn(needle, str(ctx.exception))
 
+    def test_non_string_env_keys_are_handled(self):
+        cfg = pipeline_config.from_dict({"environments": {"dev": {}, "prod": {}}})
+        self.assertEqual(cfg["github"]["admin_pat_secret"], "SF_PIPELINE_PAT")
+        with self.assertRaises(pipeline_config.ConfigError) as ctx:
+            pipeline_config.from_dict({"environments": {2024: {}, True: {}, "prod": {}}})
+        self.assertIn("'2024' must start with a letter", str(ctx.exception))
+
     def test_required_secrets_by_auth_method(self):
         cfg = pipeline_config.from_dict(
             {"environments": {"dev": {}, "prod": {"auth_method": "jwt", "secrets": {"username": "PROD_USER"}}}}
@@ -431,6 +438,10 @@ class DeployReportTests(unittest.TestCase):
         )
         self.assertTrue(tests[0].startswith("::error file=force-app/main/default/classes/FxFailTest.cls,line=1,col=1,"))
         self.assertIn("math is hard", tests[0])
+        # property values escape the workflow-command separators
+        weird = {"result": {"details": {"componentFailures": [
+            {"componentType": "Flow", "fullName": "a,b:c", "problem": "x: y, z"}]}}}
+        self.assertEqual(deploy_report.annotations(weird, "force-app"), ["::error title=Flow a%2Cb%3Ac::x: y, z"])
 
     def test_real_cli_error_without_details_shows_message(self):
         text, out = self.fixture_report("validate-testfail-cli.json", ["FxCalc"])
@@ -555,6 +566,8 @@ class BranchProtectionTests(unittest.TestCase):
         self.assertIs(int_body["enforce_admins"], True)
         self.assertIs(int_body["required_linear_history"], True)
         self.assertIs(prod_body["required_linear_history"], False)
+        self.assertIs(int_body["required_conversation_resolution"], True)
+        self.assertIs(prod_body["required_conversation_resolution"], False)  # the release job merges itself
         # Approval is enforced by the sf-approval status (label OR reviews), not GitHub's review count.
         self.assertEqual(int_body["required_pull_request_reviews"]["required_approving_review_count"], 0)
 
@@ -599,6 +612,10 @@ class GhHelpersTests(unittest.TestCase):
         self.assertIn("add the 'approved' label", why)
         self.assertIn("1/2", why)
 
+    def test_squash_subject_pr_reference(self):
+        self.assertEqual(gh_helpers._PR_REF.search("E2E: tier service (#4)").group(1), "4")
+        self.assertIsNone(gh_helpers._PR_REF.search("Merge branch 'main' into dev"))
+
     def test_pr_marker_round_trip(self):
         body = "Release notes\n\n- change"
         once = gh_helpers.write_marker(body, "sf-release", {"sha": "abc", "job_id": "0Af1"})
@@ -630,6 +647,22 @@ class BootstrapTests(unittest.TestCase):
                          {"dev": "sfp-dev", "int": "sfp-int", "qa": "x"})
         with self.assertRaises(bootstrap.SetupError):
             bootstrap.parse_pairs(["dev"], "--org")
+
+    def test_environment_settings_parse(self):
+        current = {
+            "deployment_branch_policy": {"protected_branches": True, "custom_branch_policies": False},
+            "protection_rules": [
+                {"type": "wait_timer", "wait_timer": 5},
+                {"type": "required_reviewers", "prevent_self_review": True,
+                 "reviewers": [{"type": "User", "reviewer": {"id": 42, "login": "ana"}}]},
+                {"type": "branch_policy"},
+            ],
+        }
+        policy, reviewers, other = bootstrap.environment_settings(current)
+        self.assertEqual(policy, bootstrap.PROTECTED_POLICY)
+        self.assertEqual(reviewers, [{"type": "User", "id": 42}])
+        self.assertEqual(other, {"wait_timer": 5, "prevent_self_review": True})
+        self.assertEqual(bootstrap.environment_settings({"deployment_branch_policy": None}), (None, [], {}))
 
     def test_consumer_keys_are_stable_per_env(self):
         with tempfile.TemporaryDirectory() as tmp:
