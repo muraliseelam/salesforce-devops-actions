@@ -1,0 +1,174 @@
+name: SF Pipeline Doctor
+
+# Logs in to every environment's org from GitHub Actions, using exactly the
+# secrets and auth method the pipeline uses, and reports org, user and API
+# headroom. It also checks the PAT. Run it after setting secrets, and weekly
+# so an expired login is caught before a deploy hits it.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sandboxes: ${{ steps.envs.outputs.sandboxes }}
+      prod: ${{ steps.prod.outputs.json }}
+    steps:
+      - name: Checkout pipeline files
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions
+            sf-pipeline
+
+      - name: Load production config
+        id: prod
+        uses: ./.github/actions/load-config
+        with:
+          production: "true"
+
+      - name: Non-production environments
+        id: envs
+        run: |
+          sandboxes="$(python - <<'EOF'
+          import json, sys
+          sys.path.insert(0, "sf-pipeline/scripts")
+          import pipeline_config as pc
+          cfg = pc.load()
+          print(json.dumps([n for n in cfg["promotion"]["chain"] if not cfg["environments"][n]["production"]]))
+          EOF
+          )"
+          echo "sandboxes=$sandboxes" >> "$GITHUB_OUTPUT"
+          echo "Checking: $sandboxes + production"
+
+  sandbox:
+    name: Login ${{ matrix.env }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.plan.outputs.sandboxes) }}
+    steps:
+      - name: Checkout pipeline files
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions
+            sf-pipeline
+            sfdx-project.json
+
+      - name: Load config
+        id: cfg
+        uses: ./.github/actions/load-config
+        with:
+          environment: ${{ matrix.env }}
+
+      - name: sf CLI + org login
+        id: login
+        uses: ./.github/actions/sf-setup
+        with:
+          environment: ${{ matrix.env }}
+          auth-url: ${{ secrets[fromJSON(steps.cfg.outputs.json).auth_url_secret] }}
+          username: ${{ secrets[fromJSON(steps.cfg.outputs.json).username_secret] }}
+          consumer-key: ${{ secrets[fromJSON(steps.cfg.outputs.json).consumer_key_secret] }}
+          jwt-key: ${{ secrets[fromJSON(steps.cfg.outputs.json).jwt_key_secret] }}
+
+      - name: Org report
+        env:
+          ENV_NAME: ${{ matrix.env }}
+          ALIAS: ${{ steps.login.outputs.org-alias }}
+          USERNAME: ${{ steps.login.outputs.username }}
+          ORG_ID: ${{ steps.login.outputs.org-id }}
+          URL: ${{ steps.login.outputs.instance-url }}
+          AUTH: ${{ fromJSON(steps.cfg.outputs.json).auth_method }}
+        run: |
+          api="$(sf org list limits --target-org "$ALIAS" --json \
+            | jq -r '.result[] | select(.name=="DailyApiRequests") | "\(.remaining)/\(.max)"')"
+          line="| ${ENV_NAME} | ✅ | ${AUTH} | ${USERNAME} | ${ORG_ID} | ${URL} | ${api:-?} |"
+          echo "$line"
+          {
+            echo "| Env | Login | Auth | User | Org ID | Instance | API left |"
+            echo "|---|---|---|---|---|---|---|"
+            echo "$line"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  production:
+    name: Login production
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: ${{ fromJSON(needs.plan.outputs.prod).validation_environment }}
+    steps:
+      - name: Checkout pipeline files
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/actions
+            sf-pipeline
+            sfdx-project.json
+
+      - name: sf CLI + org login
+        id: login
+        uses: ./.github/actions/sf-setup
+        with:
+          environment: ${{ fromJSON(needs.plan.outputs.prod).env }}
+          auth-url: ${{ secrets[fromJSON(needs.plan.outputs.prod).auth_url_secret] }}
+          username: ${{ secrets[fromJSON(needs.plan.outputs.prod).username_secret] }}
+          consumer-key: ${{ secrets[fromJSON(needs.plan.outputs.prod).consumer_key_secret] }}
+          jwt-key: ${{ secrets[fromJSON(needs.plan.outputs.prod).jwt_key_secret] }}
+
+      - name: Org report
+        env:
+          ENV_NAME: ${{ fromJSON(needs.plan.outputs.prod).env }}
+          ALIAS: ${{ steps.login.outputs.org-alias }}
+          USERNAME: ${{ steps.login.outputs.username }}
+          ORG_ID: ${{ steps.login.outputs.org-id }}
+          URL: ${{ steps.login.outputs.instance-url }}
+          AUTH: ${{ fromJSON(needs.plan.outputs.prod).auth_method }}
+        run: |
+          api="$(sf org list limits --target-org "$ALIAS" --json \
+            | jq -r '.result[] | select(.name=="DailyApiRequests") | "\(.remaining)/\(.max)"')"
+          line="| ${ENV_NAME} (production) | ✅ | ${AUTH} | ${USERNAME} | ${ORG_ID} | ${URL} | ${api:-?} |"
+          echo "$line"
+          {
+            echo "| Env | Login | Auth | User | Org ID | Instance | API left |"
+            echo "|---|---|---|---|---|---|---|"
+            echo "$line"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  pat:
+    name: PAT check
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the pipeline PAT
+        env:
+          GH_TOKEN: ${{ secrets[fromJSON(needs.plan.outputs.prod).pat_secret] }}
+          PAT_SECRET: ${{ fromJSON(needs.plan.outputs.prod).pat_secret }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error title=PAT::${PAT_SECRET} is not set (bootstrap.py secrets --pat-from-gh or --pat-stdin)"
+            exit 1
+          fi
+          admin="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .permissions.admin)"
+          who="$(gh api user --jq .login 2>/dev/null || echo "fine-grained token")"
+          if [ "$admin" != "true" ]; then
+            echo "::error title=PAT::${PAT_SECRET} (${who}) lacks admin rights on ${GITHUB_REPOSITORY}; the env-branch sync needs Administration: write"
+            exit 1
+          fi
+          echo "✅ ${PAT_SECRET} works (${who}, admin on ${GITHUB_REPOSITORY})" | tee -a "$GITHUB_STEP_SUMMARY"
