@@ -22,6 +22,8 @@ Legend: `[x]` done and verified · `[~]` in progress · `[ ]` to do · `[!]` blo
 - [~] A13 SF Pipeline Doctor workflow — logs in to every org from GitHub and reports — workflow written; needs secrets
 - [x] A14 Pipeline self-test workflow — unit tests + actionlint on pipeline changes — green on PRs #1-#4
 - [x] A15 Scratch-org definition for trying the pipeline without sandboxes — config/project-scratch-def.json; used to create the 5 E2E orgs
+- [x] A16 Code analysis gate (Salesforce Code Analyzer on changed files) — verified on GitHub, PR #4: report comment, Low findings listed, nothing blocking
+- [x] A17 One-command JWT (`bootstrap.py jwt-setup`): metadata-deployed External Client App + verified JWT login against a scratch org
 
 ## B. Local verification
 - [x] B5 Real-org behaviours: quick deploy (new job ID; reuse → CannotQuickDeployError), destructive-only deploy with empty package.xml, NoTestRun dry-run is check-only; found SourceConflictError on tracked orgs → `--ignore-conflicts`
@@ -43,6 +45,7 @@ Legend: `[x]` done and verified · `[~]` in progress · `[ ]` to do · `[!]` blo
 - [x] R10 Smaller: dispatch on baseline ref, CRLF-safe secret piping, case-insensitive labels, annotation escaping, non-string env keys, compare-API failure message, PR validation uses default-branch pipeline files
 
 ## C. GitHub bootstrap
+- [x] C0 Env-branch reset (sync logic) run locally after direct pipeline pushes to main: 4 branches reset, protection restored + verified each time
 - [x] C1 Pipeline committed and pushed to `main` — 3cec2ea + follow-ups
 - [x] C2 `bootstrap.py github` applied to the live repo — branches, labels, environments, protection live
 - [!] C3 Secrets set by the repo owner (`bootstrap.py secrets`) — needs the owner

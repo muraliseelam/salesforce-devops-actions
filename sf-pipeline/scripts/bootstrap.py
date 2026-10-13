@@ -26,6 +26,13 @@
 
   doctor  Check config, tools, GitHub setup and secrets; print the fix for anything missing.
 
+  setup   [secrets options]
+          github + secrets + doctor in one go: the fastest path for a new repo.
+
+  scratch-orgs --dev-hub ALIAS [--days 30] [--env ENV ...]
+          Try the pipeline without sandboxes: create one scratch org per environment
+          (aliased to each env's org_alias) from config/project-scratch-def.json.
+
 Common options: --repo OWNER/NAME (default: project.repository or the current gh repo),
 --config PATH, --dry-run (show what would change).
 """
@@ -570,6 +577,43 @@ def cmd_jwt_setup(args: argparse.Namespace, cfg: dict, repo: str) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ scratch-orgs
+
+
+def cmd_scratch_orgs(args: argparse.Namespace, cfg: dict) -> int:
+    definition = Path(args.definition)
+    if not definition.is_file():
+        raise SetupError(f"scratch org definition {definition} not found")
+    names = args.env or cfg["promotion"]["chain"]
+    print(f"Creating {len(names)} scratch org(s) from Dev Hub '{args.dev_hub}' ({args.days} days){' (dry run)' if args.dry_run else ''}")
+    for name in names:
+        if name not in cfg["environments"]:
+            raise SetupError(f"unknown environment {name!r}")
+        alias = cfg["environments"][name]["org_alias"]
+        existing = run([tool("sf"), "org", "display", "--target-org", alias, "--json"])
+        try:
+            found = json.loads(existing.stdout or "{}").get("status") == 0
+        except ValueError:
+            found = False
+        if found:
+            say("ok", f"{name}: org alias '{alias}' already exists")
+            continue
+        if args.dry_run:
+            say("plan", f"{name}: create scratch org '{alias}'")
+            continue
+        proc = run([tool("sf"), "org", "create", "scratch", "--definition-file", str(definition), "--alias", alias,
+                    "--duration-days", str(args.days), "--target-dev-hub", args.dev_hub, "--wait", "30", "--json"])
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except ValueError:
+            data = {}
+        if data.get("status") != 0:
+            raise SetupError(f"{name}: scratch org creation failed: {data.get('message') or proc.stderr.strip()}")
+        say("add", f"{name}: scratch org '{alias}' ({(data.get('result') or {}).get('username', '?')})")
+    print("Next: python sf-pipeline/scripts/bootstrap.py setup --pat-from-gh")
+    return 0
+
+
 # ----------------------------------------------------------------------- doctor
 
 
@@ -684,16 +728,29 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reviewer", action="append", help="GitHub login required to approve production deploys")
     p.add_argument("--skip-protection", action="store_true")
 
-    p = sub.add_parser("secrets", help="push org credentials into GitHub secrets")
+    def secrets_options(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--env", action="append", help="only these environments (repeatable)")
+        p.add_argument("--org", action="append", help="ENV=ALIAS when your local alias differs from org_alias")
+        p.add_argument("--jwt-key", help="private key file for jwt environments")
+        p.add_argument("--consumer-key", help="consumer key for jwt environments")
+        p.add_argument("--username", action="append", help="ENV=USERNAME for jwt environments")
+        p.add_argument("--prod-repo-level", action="store_true", help="store production secrets at repo level")
+        pat = p.add_mutually_exclusive_group()
+        pat.add_argument("--pat-from-gh", action="store_true", help="store your `gh auth token` as the PAT secret")
+        pat.add_argument("--pat-stdin", action="store_true", help="read a fine-grained PAT from stdin")
+
+    secrets_options(sub.add_parser("secrets", help="push org credentials into GitHub secrets"))
+
+    p = sub.add_parser("setup", help="github + secrets + doctor in one go")
+    secrets_options(p)
+    p.add_argument("--reviewer", action="append", help="GitHub login required to approve production deploys")
+    p.add_argument("--skip-protection", action="store_true")
+
+    p = sub.add_parser("scratch-orgs", help="create one scratch org per environment to try the pipeline")
+    p.add_argument("--dev-hub", required=True, help="alias of your Dev Hub org")
+    p.add_argument("--days", type=int, default=30)
     p.add_argument("--env", action="append", help="only these environments (repeatable)")
-    p.add_argument("--org", action="append", help="ENV=ALIAS when your local alias differs from org_alias")
-    p.add_argument("--jwt-key", help="private key file for jwt environments")
-    p.add_argument("--consumer-key", help="consumer key for jwt environments")
-    p.add_argument("--username", action="append", help="ENV=USERNAME for jwt environments")
-    p.add_argument("--prod-repo-level", action="store_true", help="store production secrets at repo level")
-    pat = p.add_mutually_exclusive_group()
-    pat.add_argument("--pat-from-gh", action="store_true", help="store your `gh auth token` as the PAT secret")
-    pat.add_argument("--pat-stdin", action="store_true", help="read a fine-grained PAT from stdin")
+    p.add_argument("--definition", default="config/project-scratch-def.json")
 
     p = sub.add_parser("jwt-setup", help="create the JWT External Client App + secrets for one env")
     p.add_argument("--env", required=True)
@@ -719,6 +776,14 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_secrets(args, cfg, repo)
         if args.command == "jwt-setup":
             return cmd_jwt_setup(args, cfg, repo)
+        if args.command == "scratch-orgs":
+            return cmd_scratch_orgs(args, cfg)
+        if args.command == "setup":
+            cmd_github(args, cfg, repo)
+            print()
+            cmd_secrets(args, cfg, repo)
+            print()
+            return cmd_doctor(args, cfg, repo)
         if args.command == "doctor":
             return cmd_doctor(args, cfg, repo)
     except (SetupError, pipeline_config.ConfigError, GhError) as exc:
